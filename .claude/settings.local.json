@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(uv sync *)",
+      "Bash(uv run python -c ' *)",
+      "Bash(uv run *)",
+      "Bash(DATABASE_URL=\"postgresql+asyncpg://u:p@localhost/offline_check\" uv run alembic upgrade head --sql)",
+      "Bash(echo \"exit=$?\")",
+      "Read(//tmp/**)",
+      "Bash(TEST_DATABASE_URL=\"postgresql+asyncpg://u:p@10.0.0.5/chocofin\" uv run pytest -q)",
+      "Bash(DATABASE_URL=\"postgresql+asyncpg://u:p@10.0.0.5/chocofin_test\" TEST_DATABASE_URL=\"postgresql+asyncpg://u:p@10.0.0.5/chocofin_test\" uv run pytest -q)",
+      "Bash(TEST_DATABASE_URL=\"postgresql+asyncpg://u:p@127.0.0.1/chocofin_test\" uv run pytest -q tests/test_models_constraints.py)",
+      "Bash(echo \"guard exit code: $?  \\(2 = hard abort, 0 would mean tests ran\\)\")"
+    ]
+  }
+}
