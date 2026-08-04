@@ -210,6 +210,75 @@ async def test_zero_amount_leg_rejected(connection: AsyncConnection):
         await connection.commit()
 
 
+# --- one clause at a time ---------------------------------------------------
+#
+# The tests above reject bad entries, but most of them are caught by the FIRST
+# clause the trigger reaches — usually the leg count — which means deleting a
+# later clause leaves them all green. These three are built to slip past every
+# clause except the one under test, so each rule is proven on its own.
+
+
+async def test_expense_source_leg_must_be_negative(connection: AsyncConnection):
+    """Isolates the expense sign clause.
+
+    One `source` leg, so the count clause is satisfied. The cross-check
+    compares `abs(leg)`, so a +100000 leg against a declared 100000 satisfies
+    that too. Nothing is left but the sign clause, which is what makes this a
+    real probe: delete it and this test goes green.
+
+    `test_expense_with_a_positive_leg_fails` does NOT cover this — it uses
+    leg_role='destination', so the count clause rejects it first.
+    """
+    ids = await seed(connection)
+    entry_id = await insert_entry(connection, ids, "expense", 100_000)
+    await insert_leg(connection, ids, entry_id, ids["cash_id"], 100_000, "source")
+
+    with pytest.raises(FAILS_AT_COMMIT):
+        await connection.commit()
+
+
+async def test_income_destination_leg_must_be_positive(connection: AsyncConnection):
+    """Pins the income sign clause by the message it raises, not by rejection.
+
+    Rejection alone cannot detect this clause going missing. A negative
+    destination leg is ALSO caught by the cross-check, because
+    `entries.amount_minor` is positive by CHECK and can therefore never equal
+    it. Isolating the sign clause would need `amount_minor` to equal a negative
+    leg, which `ck_entries_amount_positive` forbids.
+
+    What stays observable is which rule speaks first, so that is what this
+    asserts. The message is part of the contract here.
+    """
+    ids = await seed(connection)
+    entry_id = await insert_entry(connection, ids, "income", 100_000)
+    await insert_leg(connection, ids, entry_id, ids["cash_id"], -100_000, "destination")
+
+    with pytest.raises(FAILS_AT_COMMIT) as caught:
+        await connection.commit()
+    assert "destination leg must be positive" in str(caught.value)
+
+
+async def test_transfer_legs_must_sum_to_zero(connection: AsyncConnection):
+    """Isolates sum-to-zero.
+
+    Two legs, one of each role, both signed correctly, and `amount_minor`
+    matches the destination leg so the cross-check passes. Only sum-to-zero can
+    reject this: PHP 3,000.00 leaves savings and PHP 2,000.00 arrives in cash,
+    with PHP 1,000.00 unaccounted for.
+
+    `test_b_unbalanced_transfer_fails_at_commit` does NOT cover this — a
+    one-leg transfer is caught by the leg-count clause long before the sum is
+    ever examined.
+    """
+    ids = await seed(connection)
+    entry_id = await insert_entry(connection, ids, "transfer", 200_000)
+    await insert_leg(connection, ids, entry_id, ids["savings_id"], -300_000, "source")
+    await insert_leg(connection, ids, entry_id, ids["cash_id"], 200_000, "destination")
+
+    with pytest.raises(FAILS_AT_COMMIT):
+        await connection.commit()
+
+
 # --- single-row CHECKs ------------------------------------------------------
 
 
@@ -418,3 +487,106 @@ async def test_subcategory_cannot_cross_households(connection: AsyncConnection):
             connection, ids["household_id"], "Coffee", "expense", foreign_parent
         )
         await connection.commit()
+
+
+# --- name uniqueness --------------------------------------------------------
+#
+# `seed` already created accounts named 'Cash' and 'Savings' in the household.
+
+
+async def insert_account(
+    conn: AsyncConnection, household_id: int, name: str, type_: str = "cash"
+) -> int:
+    return await conn.scalar(
+        text(
+            "INSERT INTO accounts (household_id, name, type) "
+            "VALUES (:h, :n, :t) RETURNING id"
+        ),
+        {"h": household_id, "n": name, "t": type_},
+    )
+
+
+async def test_duplicate_account_name_is_rejected(connection: AsyncConnection):
+    ids = await seed(connection)
+    with pytest.raises(FAILS_AT_COMMIT):
+        await insert_account(connection, ids["household_id"], "Cash")
+        await connection.commit()
+
+
+async def test_account_name_uniqueness_is_case_insensitive(
+    connection: AsyncConnection,
+):
+    """'GoTyme' and 'gotyme' are one account, not two.
+
+    Two rows differing only in case would each accumulate their own derived
+    balance and neither would be wrong, so the split is invisible: the money is
+    simply in two places the household thinks are one.
+    """
+    ids = await seed(connection)
+    with pytest.raises(FAILS_AT_COMMIT):
+        await insert_account(connection, ids["household_id"], "cASH")
+        await connection.commit()
+
+
+async def test_the_same_account_name_in_another_household_is_fine(
+    connection: AsyncConnection,
+):
+    """Uniqueness is per household, never global. Two households both having a
+    'Cash' account is the normal case, not a collision."""
+    ids = await seed(connection)
+    other_household = await connection.scalar(
+        text("INSERT INTO households (name) VALUES ('Other') RETURNING id")
+    )
+    account_id = await insert_account(connection, other_household, "Cash")
+    await connection.commit()
+
+    assert account_id is not None
+    assert account_id != ids["cash_id"]
+
+
+async def test_duplicate_category_name_and_kind_is_rejected(
+    connection: AsyncConnection,
+):
+    ids = await seed(connection)
+    await make_category(connection, ids["household_id"], "Food", "expense")
+    await connection.commit()
+
+    with pytest.raises(FAILS_AT_COMMIT):
+        await make_category(connection, ids["household_id"], "Food", "expense")
+        await connection.commit()
+
+
+async def test_category_name_uniqueness_is_case_insensitive(
+    connection: AsyncConnection,
+):
+    """'Coffee' and 'coffee' are one category, not two.
+
+    A split category is quieter than a split account — no balance is wrong —
+    but it silently halves every report the category appears in, and only one
+    of the two can be the child of 'Food & Dining', so the rollup in
+    `summarise` drops the other.
+    """
+    ids = await seed(connection)
+    await make_category(connection, ids["household_id"], "Coffee", "expense")
+    await connection.commit()
+
+    with pytest.raises(FAILS_AT_COMMIT):
+        await make_category(connection, ids["household_id"], "cOFFEE", "expense")
+        await connection.commit()
+
+
+async def test_the_same_category_name_under_a_different_kind_is_fine(
+    connection: AsyncConnection,
+):
+    """`kind` is part of the key on purpose: an expense 'Refunds' bucket and an
+    income 'Refunds' bucket are different things and both are legitimate."""
+    ids = await seed(connection)
+    expense_side = await make_category(
+        connection, ids["household_id"], "Refunds", "expense"
+    )
+    income_side = await make_category(
+        connection, ids["household_id"], "Refunds", "income"
+    )
+    await connection.commit()
+
+    assert expense_side != income_side

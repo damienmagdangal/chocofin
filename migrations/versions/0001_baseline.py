@@ -117,8 +117,21 @@ BEGIN
                 '(has % legs, % source, % dest)',
                 v_entry_id, v_leg_count, v_source_count, v_dest_count;
         END IF;
-        -- Roles must match signs. Without this a transfer of source +3000 and
-        -- destination -3000 would sum to zero and slip through.
+        -- Roles must match signs. This clause is REACHABLE and it is what
+        -- actually fires on inverted legs — it runs first, before the two
+        -- clauses below. What it is NOT is the only thing standing between an
+        -- inverted transfer and a COMMIT: delete it and the same input is
+        -- still rejected, by whichever clause below it reaches next. If both
+        -- legs share a sign the sum is not zero; if the roles are swapped the
+        -- cross-check fails, because `entries.amount_minor` is positive by
+        -- CHECK and can never equal a negative destination leg.
+        --
+        -- So it is redundant, not dead, and it is kept on purpose as a second
+        -- line: it is the only place the rule is stated directly, and the rule
+        -- must not depend on the other two clauses surviving a future edit.
+        -- (The income arm above is redundant in exactly the same way, for the
+        -- same reason. The expense arm is NOT: its cross-check compares abs(),
+        -- so it is sign-blind, and its sign clause is the only cover there.)
         IF v_source_amount >= 0 OR v_dest_amount <= 0 THEN
             RAISE EXCEPTION
                 'transfer entry % has inverted legs: source %, destination %',

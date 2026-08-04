@@ -6,9 +6,15 @@ household data with no backups. The guard below is the only thing between a
 stray environment variable and a wiped ledger, so it aborts the whole session
 rather than skipping or warning:
 
-    * TEST_DATABASE_URL unset          -> DB tests skip (nothing to destroy)
-    * database name not ending `_test` -> HARD ABORT of the entire run
+    * TEST_DATABASE_URL unset           -> DB tests FAIL
+    * ...and ALLOW_DB_TEST_SKIP=1       -> DB tests skip, deliberately
+    * database name not ending `_test`  -> HARD ABORT of the entire run
     * TEST_DATABASE_URL == DATABASE_URL -> HARD ABORT
+
+Unset used to skip. It fails now because a skipped run and a passing run look
+identical at a glance — same green, same exit code — and two thirds of this
+suite is the DB-backed half that proves the ledger's invariants. Opting out has
+to be a thing you typed, not a thing you forgot.
 
 Pure tests (parser, periods) need no database and always run.
 """
@@ -28,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 ROOT = Path(__file__).resolve().parent.parent
 
 TEST_URL_VAR = "TEST_DATABASE_URL"
+SKIP_OPT_OUT_VAR = "ALLOW_DB_TEST_SKIP"
 REQUIRED_SUFFIX = "_test"
 
 # Truncated between tests. Order is irrelevant under CASCADE, but households
@@ -53,7 +60,9 @@ def pytest_configure(config: pytest.Config) -> None:
     """Session-start guard. Runs before any fixture or test."""
     url = os.environ.get(TEST_URL_VAR, "").strip()
     if not url:
-        return  # Nothing configured, nothing to destroy. DB tests will skip.
+        # Nothing configured, nothing to destroy. `_test_url` decides whether
+        # the DB tests fail or skip; this guard only protects real databases.
+        return
 
     name = _database_name(url)
     if not name.endswith(REQUIRED_SUFFIX):
@@ -74,14 +83,31 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def _test_url() -> str:
+    """The test database URL, or a loud stop.
+
+    Raised from the session-scoped `engine` fixture, so a missing URL errors
+    every DB-backed test at once instead of quietly removing them from the run.
+    """
     url = os.environ.get(TEST_URL_VAR, "").strip()
-    if not url:
+    if url:
+        return url
+
+    if os.environ.get(SKIP_OPT_OUT_VAR, "").strip() == "1":
         pytest.skip(
-            f"{TEST_URL_VAR} is not set — skipping DB-backed tests. "
-            f"Set it to a scratch Postgres whose name ends in {REQUIRED_SUFFIX!r}.",
+            f"{TEST_URL_VAR} is not set and {SKIP_OPT_OUT_VAR}=1 — skipping "
+            "DB-backed tests on purpose. The ledger invariants are NOT covered "
+            "by this run.",
             allow_module_level=True,
         )
-    return url
+
+    pytest.fail(
+        f"{TEST_URL_VAR} is not set, so no DB-backed test can run — and those "
+        "are the ones that prove the leg trigger, the constraints and the "
+        "summary/balance split. Point it at a scratch Postgres whose name ends "
+        f"in {REQUIRED_SUFFIX!r}, or set {SKIP_OPT_OUT_VAR}=1 if you really do "
+        "mean to run without a database.",
+        pytrace=False,
+    )
 
 
 def _run_migrations(sync_connection) -> None:

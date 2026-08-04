@@ -6,7 +6,9 @@ Rules encoded here, each of which has a test:
 * Entries are append-only. A correction voids the original and inserts a
   replacement carrying `replaces_entry_id`, in ONE transaction.
 * A replacement copies `occurred_at` from the entry it replaces. Never `now()`:
-  correcting a January entry in March must leave the money in January.
+  correcting a January entry in March must leave the money in January. It also
+  carries each tag's `origin` and `confidence` across unchanged — a correction
+  does not re-decide who tagged the entry.
 * Summaries exclude transfers AND voided entries. Balance math includes
   transfers. Two code paths, never merged — see `core.balances`.
 * Summaries never consult `exclude_from_totals`. Money spent from an excluded
@@ -19,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Literal
 
 from sqlalchemy import Select, func, select
@@ -44,10 +47,40 @@ class CategoryTotal:
 
 
 @dataclass(frozen=True, slots=True)
+class TagSpec:
+    """A tag together with its provenance.
+
+    `origin` says who decided this tag — a rule, a human, or the tagger — and
+    `confidence` how sure they were. Both must survive a correction unchanged:
+    re-stamping an AI guess as 'manual' claims a human confirmed a tag no human
+    ever saw, which quietly poisons any later measurement of how good the
+    tagger is and any rule-learning that keys off `origin='manual'`.
+
+    `confidence` is a Numeric(4,3) score, NOT money. It comes back from the
+    database as a Decimal and is carried straight through rather than being
+    routed via float, so a round trip cannot perturb it.
+    """
+
+    tag: str
+    origin: str = "manual"
+    confidence: Decimal | float | None = 1.0
+
+
+@dataclass(frozen=True, slots=True)
 class Summary:
+    """Totals for a period, with the two sides kept apart.
+
+    `by_category` breaks down EXPENSE only; `by_income_category` breaks down
+    INCOME only. Both hold unsigned totals. They are deliberately not merged
+    into one signed list: in a shared bucket, income posted against a category
+    would cancel spending in that same category, and a month with a ₱4,500.00
+    salary and ₱4,500.00 of groceries would report as an empty one.
+    """
+
     income_minor: int
     expense_minor: int
     by_category: tuple[CategoryTotal, ...]
+    by_income_category: tuple[CategoryTotal, ...]
 
     @property
     def net_minor(self) -> int:
@@ -77,16 +110,19 @@ async def _require_account(
 
 
 async def _add_tags(
-    session: AsyncSession,
-    *,
-    entry: Entry,
-    tags: Sequence[str],
-    origin: str = "manual",
-    confidence: float | None = 1.0,
+    session: AsyncSession, *, entry: Entry, tags: Sequence[str | TagSpec]
 ) -> None:
+    """Attach tags, keeping each one's provenance.
+
+    A bare string is a tag someone typed, so it defaults to manual at full
+    confidence. A `TagSpec` carries its own origin and confidence and is
+    written exactly as given — that is what lets a correction preserve the
+    history of a tag it did not author.
+    """
     seen: set[str] = set()
-    for tag in tags:
-        lowered = tag.lower()
+    for item in tags:
+        spec = TagSpec(item) if isinstance(item, str) else item
+        lowered = spec.tag.lower()
         if lowered in seen:
             continue
         seen.add(lowered)
@@ -95,8 +131,8 @@ async def _add_tags(
                 entry_id=entry.id,
                 household_id=entry.household_id,
                 tag=lowered,
-                origin=origin,
-                confidence=confidence,
+                origin=spec.origin,
+                confidence=spec.confidence,
             )
         )
 
@@ -115,7 +151,7 @@ async def _create_single_leg_entry(
     description: str | None,
     source: EntrySource,
     raw_input: str | None,
-    tags: Sequence[str],
+    tags: Sequence[str | TagSpec],
     related_entry_id: int | None,
     replaces_entry_id: int | None = None,
 ) -> Entry:
@@ -169,7 +205,7 @@ async def create_expense(
     description: str | None = None,
     source: EntrySource = "telegram",
     raw_input: str | None = None,
-    tags: Sequence[str] = (),
+    tags: Sequence[str | TagSpec] = (),
     related_entry_id: int | None = None,
 ) -> Entry:
     """One negative `source` leg against `account_id`."""
@@ -204,7 +240,7 @@ async def create_income(
     description: str | None = None,
     source: EntrySource = "telegram",
     raw_input: str | None = None,
-    tags: Sequence[str] = (),
+    tags: Sequence[str | TagSpec] = (),
 ) -> Entry:
     """One positive `destination` leg into `account_id`."""
     return await _create_single_leg_entry(
@@ -374,14 +410,20 @@ async def reassign_account(
         )
     await _require_account(session, household_id=household_id, account_id=account_id)
 
-    tags = list(
-        await session.scalars(
-            select(EntryTag.tag).where(
-                EntryTag.entry_id == original.id,
-                EntryTag.household_id == household_id,
+    # Carry origin and confidence across, not just the tag text. A correction
+    # moves an entry between accounts; it does not re-decide who tagged it or
+    # how sure they were.
+    tags = [
+        TagSpec(tag=tag, origin=origin, confidence=confidence)
+        for tag, origin, confidence in (
+            await session.execute(
+                select(EntryTag.tag, EntryTag.origin, EntryTag.confidence).where(
+                    EntryTag.entry_id == original.id,
+                    EntryTag.household_id == household_id,
+                )
             )
-        )
-    )
+        ).all()
+    ]
 
     await void_entry(
         session,
@@ -459,6 +501,56 @@ async def list_entries(
     return list(await session.scalars(stmt))
 
 
+async def _category_totals(
+    session: AsyncSession,
+    *,
+    household_id: int,
+    kind: Literal["income", "expense"],
+    start_utc: dt.datetime,
+    end_utc: dt.datetime,
+    group_by: GroupBy,
+) -> tuple[CategoryTotal, ...]:
+    """Per-category totals for ONE kind over a half-open period.
+
+    Run once for expense and once for income, never together — see `Summary`
+    for why the two breakdowns stay separate. Transfers cannot reach here:
+    `kind` is only ever 'income' or 'expense', and a transfer carries no
+    category at all (`ck_entries_transfer_has_no_category`).
+    """
+    if group_by == "parent":
+        # COALESCE(parent_id, id) folds a child into its parent and leaves a
+        # top-level category as itself.
+        bucket = func.coalesce(Category.parent_id, Category.id)
+    else:
+        bucket = Category.id
+
+    stmt = (
+        select(bucket.label("bucket"), func.sum(Entry.amount_minor))
+        .select_from(Entry)
+        .outerjoin(
+            Category,
+            (Category.id == Entry.category_id)
+            & (Category.household_id == Entry.household_id),
+        )
+        .where(
+            Entry.household_id == household_id,
+            Entry.voided_at.is_(None),
+            Entry.kind == kind,
+            Entry.occurred_at >= start_utc,
+            Entry.occurred_at < end_utc,
+        )
+        .group_by("bucket")
+        .order_by("bucket")
+    )
+    return tuple(
+        CategoryTotal(
+            category_id=int(bucket) if bucket is not None else None,
+            total_minor=int(total),
+        )
+        for bucket, total in (await session.execute(stmt)).all()
+    )
+
+
 async def summarise(
     session: AsyncSession,
     *,
@@ -475,8 +567,9 @@ async def summarise(
 
     `group_by="parent"` rolls subcategory totals into their parent;
     `"leaf"` reports each subcategory separately. Entries with no category are
-    reported under `category_id=None` rather than dropped, so the breakdown
-    always sums to the period total.
+    reported under `category_id=None` rather than dropped, so each breakdown
+    always sums to its own side of the period total: `by_category` to
+    `expense_minor`, `by_income_category` to `income_minor`.
     """
     base = (
         select(Entry.kind, func.sum(Entry.amount_minor))
@@ -491,41 +584,23 @@ async def summarise(
     )
     totals = {kind: int(total) for kind, total in (await session.execute(base)).all()}
 
-    if group_by == "parent":
-        # COALESCE(parent_id, id) folds a child into its parent and leaves a
-        # top-level category as itself.
-        bucket = func.coalesce(Category.parent_id, Category.id)
-    else:
-        bucket = Category.id
-
-    by_category_stmt = (
-        select(bucket.label("bucket"), func.sum(Entry.amount_minor))
-        .select_from(Entry)
-        .outerjoin(
-            Category,
-            (Category.id == Entry.category_id)
-            & (Category.household_id == Entry.household_id),
-        )
-        .where(
-            Entry.household_id == household_id,
-            Entry.voided_at.is_(None),
-            Entry.kind == "expense",
-            Entry.occurred_at >= start_utc,
-            Entry.occurred_at < end_utc,
-        )
-        .group_by("bucket")
-        .order_by("bucket")
-    )
-    by_category = tuple(
-        CategoryTotal(
-            category_id=int(bucket) if bucket is not None else None,
-            total_minor=int(total),
-        )
-        for bucket, total in (await session.execute(by_category_stmt)).all()
-    )
-
     return Summary(
         income_minor=totals.get("income", 0),
         expense_minor=totals.get("expense", 0),
-        by_category=by_category,
+        by_category=await _category_totals(
+            session,
+            household_id=household_id,
+            kind="expense",
+            start_utc=start_utc,
+            end_utc=end_utc,
+            group_by=group_by,
+        ),
+        by_income_category=await _category_totals(
+            session,
+            household_id=household_id,
+            kind="income",
+            start_utc=start_utc,
+            end_utc=end_utc,
+            group_by=group_by,
+        ),
     )

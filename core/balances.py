@@ -10,7 +10,9 @@ Sign convention: assets positive, liabilities negative. A credit card you owe
 `credit_limit_minor + balance_minor`.
 
 `exclude_from_totals` is honoured HERE and only here — an excluded account
-still reports its own balance, it is just left out of net worth.
+still reports its own balance, it is just left out of net worth. It is also the
+ONLY flag that does so: `is_active` controls visibility, never money, and never
+reaches `net_worth_minor`.
 """
 
 from __future__ import annotations
@@ -126,18 +128,24 @@ async def available_credit(
     return balance.available_credit_minor
 
 
-async def net_worth_minor(
-    session: AsyncSession, *, household_id: int, include_inactive: bool = False
-) -> int:
+async def net_worth_minor(session: AsyncSession, *, household_id: int) -> int:
     """Sum of balances, skipping accounts flagged `exclude_from_totals`.
 
-    This is the only place that flag applies. It must never reach a spending
-    summary: money spent from an excluded account is still spending.
+    That flag is the ONLY thing that removes an account from this total, and
+    this is the only place it applies. It must never reach a spending summary:
+    money spent from an excluded account is still spending.
+
+    `is_active` deliberately has no say here, which is why this function takes
+    no `include_inactive` switch to get wrong. Deactivating an account hides it
+    from pickers and listings; it does not settle its balance. A closed card
+    still owing PHP 3,000.00 is PHP 3,000.00 the household still owes, and
+    dropping it would make net worth jump by exactly the amount of a debt that
+    never went anywhere.
     """
     return sum(
         b.balance_minor
         for b in await account_balances(
-            session, household_id=household_id, include_inactive=include_inactive
+            session, household_id=household_id, include_inactive=True
         )
         if not b.exclude_from_totals
     )

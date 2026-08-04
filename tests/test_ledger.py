@@ -16,7 +16,7 @@ from core.errors import (
     InvalidAmountError,
     SameAccountTransferError,
 )
-from core.models import Entry, EntryLeg
+from core.models import Entry, EntryLeg, EntryTag
 from core.periods import resolve
 from tests.factories import FEB_10, JAN_15, MAR_20, build_world
 
@@ -464,6 +464,79 @@ async def test_reassign_refuses_transfers(session: AsyncSession):
         )
 
 
+async def test_reassign_preserves_tag_provenance(session: AsyncSession):
+    """A correction moves money between accounts. It does not re-author tags.
+
+    The tagger guessed '#lunch' at 0.62 confidence. If the replacement carries
+    that tag as manual/1.0, the ledger now claims a human confirmed a tag no
+    human ever saw — which poisons any later measure of how good the tagger is,
+    and any rule-learning that keys off origin='manual'.
+    """
+    world = await build_world(session)
+    original = await ledger.create_expense(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        account_id=world.cash_id,
+        amount_minor=32_000,
+        occurred_at=JAN_15,
+        note="lunch",
+        tags=[ledger.TagSpec("lunch", origin="ai", confidence=0.62)],
+    )
+    await session.commit()
+
+    replacement = await ledger.reassign_account(
+        session,
+        household_id=world.household_id,
+        entry_id=original.id,
+        account_id=world.savings_id,
+    )
+    await session.commit()
+
+    carried = (
+        await session.execute(
+            select(EntryTag.tag, EntryTag.origin, EntryTag.confidence).where(
+                EntryTag.entry_id == replacement.id,
+                EntryTag.household_id == world.household_id,
+            )
+        )
+    ).all()
+    assert len(carried) == 1
+    tag, origin, confidence = carried[0]
+    assert tag == "lunch"
+    assert origin == "ai"
+    assert float(confidence) == 0.62
+
+
+async def test_plain_string_tags_are_manual(session: AsyncSession):
+    """The other half of the rule: a tag someone typed IS manual, at full
+    confidence. Only a carried tag keeps someone else's provenance."""
+    world = await build_world(session)
+    entry = await ledger.create_expense(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        account_id=world.cash_id,
+        amount_minor=1_000,
+        occurred_at=JAN_15,
+        tags=["Bonus"],
+    )
+    await session.commit()
+
+    rows = (
+        await session.execute(
+            select(EntryTag.tag, EntryTag.origin, EntryTag.confidence).where(
+                EntryTag.entry_id == entry.id
+            )
+        )
+    ).all()
+    assert len(rows) == 1
+    tag, origin, confidence = rows[0]
+    assert tag == "bonus"  # lowercased on the way in
+    assert origin == "manual"
+    assert float(confidence) == 1.0
+
+
 # --- list_entries -----------------------------------------------------------
 
 
@@ -673,6 +746,59 @@ async def test_summarise_keeps_uncategorised_spending_visible(
     assert any(c.category_id is None for c in summary.by_category)
 
 
+async def test_summarise_breaks_down_income_by_category(session: AsyncSession):
+    """Income gets its own breakdown, and it stays out of the expense one.
+
+    The two are separate fields on purpose. Merged into one signed list, the
+    salary below would cancel most of the groceries and the month would report
+    as almost nothing happening.
+    """
+    world = await build_world(session)
+    common = {
+        "household_id": world.household_id,
+        "member_id": world.member_id,
+        "occurred_at": JAN_15,
+    }
+    await ledger.create_income(
+        session,
+        account_id=world.cash_id,
+        amount_minor=4_500_000,
+        category_id=world.salary_id,
+        **common,
+    )
+    await ledger.create_income(
+        session,
+        account_id=world.cash_id,
+        amount_minor=120_000,
+        category_id=None,
+        **common,
+    )
+    await ledger.create_expense(
+        session,
+        account_id=world.cash_id,
+        amount_minor=15_000,
+        category_id=world.coffee_id,
+        **common,
+    )
+    await session.commit()
+
+    start, end = january()
+    summary = await ledger.summarise(
+        session, household_id=world.household_id, start_utc=start, end_utc=end
+    )
+
+    income = {c.category_id: c.total_minor for c in summary.by_income_category}
+    assert income == {world.salary_id: 4_500_000, None: 120_000}
+    assert sum(income.values()) == summary.income_minor
+
+    # And the expense breakdown is untouched: Coffee still rolls up to Food,
+    # with no income bucket anywhere in it.
+    assert {c.category_id: c.total_minor for c in summary.by_category} == {
+        world.food_id: 15_000
+    }
+    assert sum(c.total_minor for c in summary.by_category) == summary.expense_minor
+
+
 async def test_summarise_is_scoped_to_the_household(session: AsyncSession):
     world = await build_world(session)
     await ledger.create_expense(
@@ -829,6 +955,46 @@ async def test_available_credit_is_none_for_non_cards(session: AsyncSession):
         session, household_id=world.household_id, account_id=world.cash_id
     )
     assert credit is None
+
+
+async def test_net_worth_includes_deactivated_accounts(session: AsyncSession):
+    """`is_active` hides an account from pickers. It does not settle its debt.
+
+    A closed card still owing PHP 3,000.00 is PHP 3,000.00 the household still
+    owes. Dropping it from net worth would make the household appear PHP
+    3,000.00 richer at the exact moment it stopped using the card, with the
+    debt sitting untouched in the ledger the whole time.
+    """
+    from core.models import Account
+
+    world = await build_world(session)
+    await ledger.create_expense(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        account_id=world.card_id,
+        amount_minor=300_000,
+        occurred_at=JAN_15,
+    )
+    await session.commit()
+    assert (
+        await balances.net_worth_minor(session, household_id=world.household_id)
+    ) == -300_000
+
+    card = await session.scalar(select(Account).where(Account.id == world.card_id))
+    card.is_active = False
+    await session.commit()
+
+    assert (
+        await balances.net_worth_minor(session, household_id=world.household_id)
+    ) == -300_000
+
+    # ...and `exclude_from_totals` is still the one flag that does remove it.
+    card.exclude_from_totals = True
+    await session.commit()
+    assert (
+        await balances.net_worth_minor(session, household_id=world.household_id)
+    ) == 0
 
 
 async def test_opening_balance_is_part_of_the_derived_balance(

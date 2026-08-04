@@ -156,9 +156,8 @@ class Category(Base):
         CheckConstraint(
             "parent_id IS NULL OR parent_id <> id", name="ck_categories_not_self_parent"
         ),
-        UniqueConstraint(
-            "household_id", "name", "kind", name="uq_categories_household_name_kind"
-        ),
+        # Name uniqueness is case-insensitive and lives in a functional index
+        # below, which a table-level UniqueConstraint cannot express.
         UniqueConstraint("id", "household_id", name="uq_categories_id_household"),
         # Composite: a subcategory must live in its parent's household.
         ForeignKeyConstraint(
@@ -169,6 +168,21 @@ class Category(Base):
         ),
         Index("ix_categories_household", "household_id"),
     )
+
+
+# Outside the class body: a functional index needs a real column expression,
+# which does not exist while the class is still being constructed.
+#
+# Case-insensitive on `name`, but NOT on `kind` — `kind` is a fixed vocabulary
+# guarded by ck_categories_kind, not user text. 'Coffee' and 'coffee' are one
+# category; an expense 'Refunds' and an income 'Refunds' are two, correctly.
+Index(
+    "uq_categories_household_name_kind_lower",
+    Category.__table__.c.household_id,
+    func.lower(Category.__table__.c.name),
+    Category.__table__.c.kind,
+    unique=True,
+)
 
 
 # --- accounts ---------------------------------------------------------------
@@ -220,7 +234,8 @@ class Account(Base):
             "billing_account_id IS NULL OR billing_account_id <> id",
             name="ck_accounts_not_self_billing",
         ),
-        UniqueConstraint("household_id", "name", name="uq_accounts_household_name"),
+        # Name uniqueness is case-insensitive and lives in a functional index
+        # below, which a table-level UniqueConstraint cannot express.
         UniqueConstraint("id", "household_id", name="uq_accounts_id_household"),
         # Composite: a card's billing account must be in the same household.
         ForeignKeyConstraint(
@@ -231,6 +246,21 @@ class Account(Base):
         ),
         Index("ix_accounts_household", "household_id"),
     )
+
+
+# Defined outside the class body because a functional index needs a real column
+# expression, which does not exist while the class is still being constructed.
+#
+# Case-insensitive on purpose: 'GoTyme' and 'gotyme' are one account. Two rows
+# differing only in case would each accumulate their own derived balance, and
+# neither would be wrong — the household's money would simply be split in half
+# with nothing to show for it.
+Index(
+    "uq_accounts_household_name_lower",
+    Account.__table__.c.household_id,
+    func.lower(Account.__table__.c.name),
+    unique=True,
+)
 
 
 # --- entries ----------------------------------------------------------------
