@@ -29,9 +29,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import (
     AccountNotFoundError,
+    CardHasNoBillingAccountError,
     EntryAlreadyVoidedError,
     EntryNotFoundError,
     InvalidAmountError,
+    NotACreditCardError,
     SameAccountTransferError,
 )
 from core.models import Account, Category, Entry, EntryLeg, EntryTag
@@ -351,6 +353,68 @@ async def create_transfer(
     return entry
 
 
+async def settle_card(
+    session: AsyncSession,
+    *,
+    household_id: int,
+    member_id: int,
+    card_id: int,
+    amount_minor: int,
+    occurred_at: dt.datetime,
+    source_account_id: int | None = None,
+    note: str | None = None,
+    description: str | None = None,
+    source: EntrySource = "telegram",
+    raw_input: str | None = None,
+) -> Entry:
+    """Pay down a credit card. A TRANSFER, never an expense.
+
+    The purchases were the spending; they were expensed when they happened.
+    Booking the settlement as an expense too would count the same money twice
+    and turn every month you pay a card into a month you overspent. So this
+    moves money from the paying account into the card, and `summarise` never
+    sees it.
+
+    Which account pays is resolved here, not by the caller: "a settlement comes
+    from the card's billing account" is a domain rule, and `bot/` and `api/`
+    are adapters that must not know it. An explicit `source_account_id` wins,
+    for the month you settle from somewhere else; otherwise the card's
+    `billing_account_id` is used; if there is neither, this raises rather than
+    picking an account, because inventing where the money came from is a lie
+    about real money.
+
+    The card's statement cycle — closing dates, minimum due, what is even in
+    this month's bill — is deliberately not modelled here.
+    """
+    card = await _require_account(
+        session, household_id=household_id, account_id=card_id
+    )
+    if card.type != "credit_card":
+        raise NotACreditCardError(
+            f"account {card_id} is a {card.type!r}, not a credit card"
+        )
+
+    paying_account_id = source_account_id or card.billing_account_id
+    if paying_account_id is None:
+        raise CardHasNoBillingAccountError(
+            f"card {card_id} has no billing account and no source was given"
+        )
+
+    return await create_transfer(
+        session,
+        household_id=household_id,
+        member_id=member_id,
+        source_account_id=paying_account_id,
+        destination_account_id=card_id,
+        amount_minor=amount_minor,
+        occurred_at=occurred_at,
+        note=note,
+        description=description,
+        source=source,
+        raw_input=raw_input,
+    )
+
+
 async def get_entry(
     session: AsyncSession, *, household_id: int, entry_id: int
 ) -> Entry:
@@ -360,6 +424,28 @@ async def get_entry(
     if entry is None:
         raise EntryNotFoundError(f"entry {entry_id} is not in household {household_id}")
     return entry
+
+
+async def list_legs(
+    session: AsyncSession, *, household_id: int, entry_id: int
+) -> Sequence[EntryLeg]:
+    """The signed movements an entry actually wrote.
+
+    For reading back what happened rather than re-deriving it. A caller that
+    wants to name a transfer's two accounts should ask the legs, not re-apply
+    the rule that chose them — otherwise the display and the ledger are two
+    implementations of the same decision, free to disagree.
+    """
+    return list(
+        await session.scalars(
+            select(EntryLeg)
+            .where(
+                EntryLeg.entry_id == entry_id,
+                EntryLeg.household_id == household_id,
+            )
+            .order_by(EntryLeg.leg_role, EntryLeg.id)
+        )
+    )
 
 
 async def void_entry(
@@ -466,6 +552,7 @@ async def list_entries(
     kinds: Sequence[str] | None = None,
     account_id: int | None = None,
     include_voided: bool = False,
+    newest_first: bool = False,
     limit: int | None = None,
     offset: int | None = None,
 ) -> Sequence[Entry]:
@@ -473,6 +560,14 @@ async def list_entries(
 
     `[start_utc, end_utc)` is half-open — the caller gets these from
     `core.periods.resolve`, which already resolved them in Manila.
+
+    `newest_first` reverses the ordering, which is the only way to ask for the
+    most recent N: with the default ascending order, `limit=5` returns the five
+    OLDEST entries in range, and "show me what I just logged" cannot be
+    expressed at all. `id` breaks ties in the same direction as `occurred_at`,
+    so two entries sharing a timestamp — everything dated `@yesterday` lands on
+    Manila midnight — come back in the order they were written rather than
+    arbitrarily.
     """
     stmt = select(Entry).where(Entry.household_id == household_id)
     stmt = _live(stmt, include_voided)
@@ -493,7 +588,10 @@ async def list_entries(
             )
         )
 
-    stmt = stmt.order_by(Entry.occurred_at, Entry.id)
+    if newest_first:
+        stmt = stmt.order_by(Entry.occurred_at.desc(), Entry.id.desc())
+    else:
+        stmt = stmt.order_by(Entry.occurred_at, Entry.id)
     if limit is not None:
         stmt = stmt.limit(limit)
     if offset is not None:

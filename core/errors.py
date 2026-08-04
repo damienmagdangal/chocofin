@@ -32,5 +32,21 @@ class SameAccountTransferError(LedgerError):
     """A transfer's source and destination are the same account."""
 
 
+class NotACreditCardError(LedgerError):
+    """A settlement was aimed at an account that is not a credit card.
+
+    Settling something that cannot be owed is not a transfer with a typo in
+    it; it is a different operation the caller has not asked for.
+    """
+
+
+class CardHasNoBillingAccountError(LedgerError):
+    """A card settlement has no source and the card names no billing account.
+
+    Guessing one would invent the money's origin. The caller must say which
+    account is paying.
+    """
+
+
 class PeriodError(ChocoFinError):
     """A period could not be resolved."""

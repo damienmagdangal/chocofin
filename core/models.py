@@ -1,4 +1,4 @@
-"""SQLAlchemy 2.x models for the seven in-scope tables.
+"""SQLAlchemy 2.x models for the eight in-scope tables.
 
 Schema notes that are easy to get wrong and expensive to get wrong:
 
@@ -33,7 +33,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import TIMESTAMP
+from sqlalchemy.dialects.postgresql import ARRAY, TIMESTAMP
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -451,4 +451,86 @@ class EntryTag(Base):
             ondelete="CASCADE",
         ),
         Index("ix_entry_tags_household_tag", "household_id", "tag"),
+    )
+
+
+# --- pending_entries --------------------------------------------------------
+
+
+class PendingEntry(Base):
+    """A parsed message waiting for an account to be chosen.
+
+    This is the one table in the schema that is genuinely mutable. It is NOT
+    part of the ledger: nothing here has moved any money, and the row is
+    deleted the instant it becomes an `Entry`. The append-only rule protects
+    `entries`, where the money lives, and does not reach here.
+
+    It exists because CLAUDE.md forbids keeping a half-finished entry in
+    process memory. A restart between "100 coffee" and the account tap would
+    otherwise strand the keyboard: the buttons would still be on screen and
+    every one of them dead. Because the state is a row, the same tap works an
+    hour and a redeploy later.
+
+    Every `parsed_*` column is nullable. The bot only ever writes rows it has
+    fully parsed, but the schema does not insist, so a future flow can ask for
+    a missing piece without a migration.
+    """
+
+    __tablename__ = "pending_entries"
+
+    id: Mapped[int] = _pk()
+    household_id: Mapped[int] = mapped_column(
+        ForeignKey("households.id", ondelete="RESTRICT"), nullable=False
+    )
+    member_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    raw_input: Mapped[str] = mapped_column(Text, nullable=False)
+    parsed_amount_minor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    parsed_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parsed_category_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    parsed_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The parser already found these. Storing them means the raw message is
+    # parsed exactly once, so there is no second parse to disagree with the
+    # first about what the user actually typed.
+    parsed_tags: Mapped[list[str] | None] = mapped_column(ARRAY(Text), nullable=True)
+    # A transfer needs two accounts and the keyboard can only ask for one at a
+    # time. This holds the first answer across the gap between the two taps.
+    source_account_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    occurred_at: Mapped[dt.datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    created_at: Mapped[dt.datetime] = _created_at()
+    expires_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            f"parsed_kind IS NULL OR {_in('parsed_kind', ENTRY_KINDS)}",
+            name="ck_pending_entries_kind",
+        ),
+        CheckConstraint(
+            "parsed_amount_minor IS NULL OR parsed_amount_minor > 0",
+            name="ck_pending_entries_amount_positive",
+        ),
+        ForeignKeyConstraint(
+            ["member_id", "household_id"],
+            ["members.id", "members.household_id"],
+            name="fk_pending_entries_member_household",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["parsed_category_id", "household_id"],
+            ["categories.id", "categories.household_id"],
+            name="fk_pending_entries_category_household",
+            ondelete="RESTRICT",
+        ),
+        # Composite, like every other cross-table reference here: a pending row
+        # must not be able to point at an account in another household.
+        ForeignKeyConstraint(
+            ["source_account_id", "household_id"],
+            ["accounts.id", "accounts.household_id"],
+            name="fk_pending_entries_source_account_household",
+            ondelete="RESTRICT",
+        ),
+        Index("ix_pending_entries_expires", "expires_at"),
     )
