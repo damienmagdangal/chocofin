@@ -100,7 +100,9 @@ def test_esc_neutralises_html_in_user_text():
     `&` escaped in text, and turning every "Jerry's" into "Jerry&#x27;s" would
     be visible in the message.
     """
-    assert esc("Ben & Jerry's <b>sale</b>") == "Ben &amp; Jerry's &lt;b&gt;sale&lt;/b&gt;"
+    assert (
+        esc("Ben & Jerry's <b>sale</b>") == "Ben &amp; Jerry's &lt;b&gt;sale&lt;/b&gt;"
+    )
 
 
 def test_account_label_carries_emoji():

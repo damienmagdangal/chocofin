@@ -21,7 +21,7 @@ BIGINT_MAX = 9_223_372_036_854_775_807
 
 def test_round_trip():
     for action in Action:
-        data = encode(action, 1, 2) if action not in (Action.DISMISS,) else encode(action)
+        data = encode(action) if action is Action.DISMISS else encode(action, 1, 2)
         parsed = decode(data)
         assert parsed is not None
         assert parsed.action is action

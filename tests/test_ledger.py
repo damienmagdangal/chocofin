@@ -537,6 +537,86 @@ async def test_plain_string_tags_are_manual(session: AsyncSession):
     assert float(confidence) == 1.0
 
 
+async def test_transfer_tags_survive_a_commit(session: AsyncSession):
+    """A transfer holds tags on exactly the same terms as an expense.
+
+    A transfer carries no category at all — `ck_entries_transfer_has_no_category`
+    forbids one — so a tag is the only label it can ever have. The parser reads
+    tags off `/transfer 500 gcash top-up`, the pending row stores them, and the
+    commit has to write them: otherwise the one kind of entry that cannot be
+    categorised is also the one kind that cannot be labelled.
+    """
+    world = await build_world(session)
+    entry = await ledger.create_transfer(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        source_account_id=world.cash_id,
+        destination_account_id=world.savings_id,
+        amount_minor=500_000,
+        occurred_at=JAN_15,
+        tags=["Savings", "savings", "Top-Up"],
+    )
+    await session.commit()
+
+    rows = (
+        await session.execute(
+            select(EntryTag.tag, EntryTag.origin, EntryTag.confidence)
+            .where(EntryTag.entry_id == entry.id)
+            .order_by(EntryTag.tag)
+        )
+    ).all()
+    # Lowercased and de-duplicated, identically to create_expense.
+    assert [tag for tag, _, _ in rows] == ["savings", "top-up"]
+    assert all(origin == "manual" for _, origin, _ in rows)
+    assert all(float(confidence) == 1.0 for _, _, confidence in rows)
+
+    # Tagging moved no money: still two legs, still summing to zero.
+    legs = list(
+        await session.scalars(select(EntryLeg).where(EntryLeg.entry_id == entry.id))
+    )
+    assert len(legs) == 2
+    assert sum(leg.amount_minor for leg in legs) == 0
+
+
+async def test_transfer_tags_do_not_leak_onto_the_fee(session: AsyncSession):
+    """The fee is its own expense entry, and it does not inherit the tags.
+
+    Copying them across would double every tag total that counts entries, and
+    would claim the user labelled a fee they never saw.
+    """
+    world = await build_world(session)
+    transfer = await ledger.create_transfer(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        source_account_id=world.cash_id,
+        destination_account_id=world.savings_id,
+        amount_minor=500_000,
+        occurred_at=JAN_15,
+        tags=["topup"],
+        fee_minor=1_500,
+    )
+    await session.commit()
+
+    fee = await session.scalar(
+        select(Entry).where(Entry.related_entry_id == transfer.id)
+    )
+    assert fee is not None
+    assert fee.kind == "expense"
+    fee_tags = list(
+        await session.scalars(select(EntryTag.tag).where(EntryTag.entry_id == fee.id))
+    )
+    assert fee_tags == []
+    # ...and the transfer kept its own.
+    kept = list(
+        await session.scalars(
+            select(EntryTag.tag).where(EntryTag.entry_id == transfer.id)
+        )
+    )
+    assert kept == ["topup"]
+
+
 # --- list_entries -----------------------------------------------------------
 
 

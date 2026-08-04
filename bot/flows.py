@@ -500,6 +500,7 @@ async def commit_destination(
                 note=claimed.parsed_note,
                 source="telegram",
                 raw_input=claimed.raw_input,
+                tags=claimed.parsed_tags,
             )
         else:
             entry = await ledger.settle_card(

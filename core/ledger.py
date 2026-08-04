@@ -276,6 +276,7 @@ async def create_transfer(
     description: str | None = None,
     source: EntrySource = "telegram",
     raw_input: str | None = None,
+    tags: Sequence[str | TagSpec] = (),
     fee_minor: int | None = None,
     fee_account_id: int | None = None,
     fee_category_id: int | None = None,
@@ -284,6 +285,16 @@ async def create_transfer(
 
     A card settlement is exactly this: a transfer from the billing account to
     the card account.
+
+    `tags` attach to the transfer exactly as they do for an expense or an
+    income — same de-duplication, same lowercasing, same provenance. A transfer
+    carries no category (`ck_entries_transfer_has_no_category`), so a tag is
+    the ONLY label it can hold; dropping tags here would make "gcash top-up"
+    unsearchable while the identical words on an expense stayed findable.
+
+    They do NOT propagate to the fee entry below. The fee is its own expense,
+    and copying the transfer's tags onto it would double every tag total that
+    counts entries.
 
     `fee_minor`, if given, becomes a SEPARATE one-leg expense entry pointing
     back at this transfer via `related_entry_id`. It is never a third leg — a
@@ -334,6 +345,7 @@ async def create_transfer(
             ),
         ]
     )
+    await _add_tags(session, entry=entry, tags=tags)
     await session.flush()
 
     if fee_minor:
