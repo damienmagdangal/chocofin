@@ -19,8 +19,9 @@ from bot import flows
 from bot.auth import Actor
 from bot.callbacks import decode
 from bot.keyboards import Keyboard
-from core import ledger
-from core.models import Entry, EntryTag
+from core import accounts as core_accounts
+from core import ledger, pending
+from core.models import Entry, EntryTag, PendingEntry
 from tests.factories import JAN_15, World, build_world
 
 pytestmark = pytest.mark.asyncio
@@ -120,6 +121,61 @@ async def test_other_on_a_pay_keyboard_stays_a_settlement(session: AsyncSession)
     by_role = {leg.leg_role: leg for leg in legs}
     assert by_role["source"].account_id == world.savings_id
     assert by_role["destination"].account_id == world.card_id
+
+
+async def test_transfer_source_stops_when_the_pending_row_has_gone(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+):
+    """A vanished row must end the flow, not draw a second keyboard.
+
+    `pick_transfer_source` reads the row with `get`, which takes no lock, then
+    records the source with an UPDATE. Between those two there is a real window:
+    a competing tap can claim the row, or a /cancel can remove it. The UPDATE
+    then matches nothing and returns False — which the caller used to discard,
+    so it went on to render "To which account?" over a pending row that no
+    longer existed. Every button on that keyboard was already dead.
+
+    The window is only reachable by landing in it, so the account lookup that
+    sits inside it is where the competing tap is injected.
+    """
+    world = await build_world(session)
+    actor = _actor(world)
+
+    started = await flows.start_transfer(
+        session, actor, raw="/transfer 500", now=JAN_15
+    )
+    pending_id = _pending_id(started.keyboard)
+
+    real_get_account = core_accounts.get_account
+
+    async def claim_it_first(*args, **kwargs):
+        await pending.claim(
+            session, household_id=world.household_id, pending_id=pending_id
+        )
+        return await real_get_account(*args, **kwargs)
+
+    monkeypatch.setattr(core_accounts, "get_account", claim_it_first)
+
+    reply = await flows.pick_transfer_source(
+        session, actor, pending_id=pending_id, account_id=world.cash_id, now=JAN_15
+    )
+    await session.commit()
+
+    # The load-bearing assertion: no keyboard. Before the fix this was a full
+    # destination picker.
+    assert reply.keyboard is None
+    assert reply.text == flows.ALREADY_DONE
+    assert reply.toast == flows.ALREADY_DONE
+
+    # And nothing was written or left behind on either side of the ledger.
+    assert (
+        await session.scalar(
+            select(Entry).where(Entry.household_id == world.household_id)
+        )
+    ) is None
+    assert (
+        await session.scalar(select(PendingEntry).where(PendingEntry.id == pending_id))
+    ) is None
 
 
 async def test_pay_tags_survive_the_commit(session: AsyncSession):

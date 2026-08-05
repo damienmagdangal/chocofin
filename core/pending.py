@@ -100,6 +100,10 @@ async def create(
 ) -> PendingEntry:
     """Park a parsed message until an account is chosen.
 
+    NOT a pure insert: it also DELETEs this member's expired rows — see the
+    sweep paragraph below, which a test counting `pending_entries` has to know
+    about before it blames the wrong statement.
+
     `intent` is required and has no default. It is the flow's identity — which
     question the keyboard is asking — and every later step reads it instead of
     guessing from which columns are still NULL. A default here would put the

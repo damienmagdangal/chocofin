@@ -456,12 +456,21 @@ async def pick_transfer_source(
             f"account {account_id} is not in household {actor.household_id}"
         )
 
-    await pending.set_source_account(
+    stored = await pending.set_source_account(
         session,
         household_id=actor.household_id,
         pending_id=pending_id,
         account_id=account_id,
     )
+    if not stored:
+        # The row went between the read above and this write: a competing tap
+        # claimed it, or a /cancel removed it. `get` is deliberately not a lock,
+        # so that window exists and this UPDATE is what closes it — it matched
+        # nothing, so the source was never recorded. Rendering the destination
+        # keyboard anyway would put a row of live-looking buttons on screen for
+        # a pending row that is gone, and every one of them would answer
+        # "Already recorded" on the tap. Say it once, now.
+        return Reply(text=ALREADY_DONE, toast=ALREADY_DONE)
 
     settling = row.intent == "settlement"
     label = INTENT_LABELS.get(row.intent, row.intent.title())

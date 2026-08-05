@@ -11,9 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core import balances, ledger
 from core.errors import (
     AccountNotFoundError,
+    CardHasNoBillingAccountError,
     EntryAlreadyVoidedError,
     EntryNotFoundError,
     InvalidAmountError,
+    NotACreditCardError,
     SameAccountTransferError,
 )
 from core.models import Entry, EntryLeg, EntryTag
@@ -661,6 +663,259 @@ async def test_settle_card_keeps_its_tags(session: AsyncSession):
     assert sum(leg.amount_minor for leg in legs) == 0
 
 
+# --- settle_card ------------------------------------------------------------
+
+
+async def test_settle_card_moves_money_from_the_billing_account(
+    session: AsyncSession,
+):
+    """The happy path: no source given, so the card's `billing_account_id` pays.
+
+    Which account pays is resolved in `core`, not by the caller — an adapter
+    that had to know "a settlement comes from the billing account" would be a
+    second copy of the rule, free to drift from this one.
+    """
+    world = await build_world(session)
+    entry = await ledger.settle_card(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        card_id=world.card_id,
+        amount_minor=300_000,
+        occurred_at=JAN_15,
+    )
+    await session.commit()
+
+    assert entry.kind == "transfer"
+    assert entry.amount_minor == 300_000
+    assert entry.category_id is None  # a transfer never carries one
+
+    legs = await ledger.list_legs(
+        session, household_id=world.household_id, entry_id=entry.id
+    )
+    by_role = {leg.leg_role: leg for leg in legs}
+    assert by_role["source"].account_id == world.savings_id
+    assert by_role["source"].amount_minor == -300_000
+    assert by_role["destination"].account_id == world.card_id
+    assert by_role["destination"].amount_minor == 300_000
+
+    savings = await balances.account_balance(
+        session, household_id=world.household_id, account_id=world.savings_id
+    )
+    card = await balances.account_balance(
+        session, household_id=world.household_id, account_id=world.card_id
+    )
+    assert savings.balance_minor == -300_000
+    assert card.balance_minor == 300_000
+
+
+async def test_settle_card_rejects_a_non_card_account(session: AsyncSession):
+    """Settling Cash is meaningless: there is no debt to pay down.
+
+    Letting it through would write a transfer from Savings into Cash and call it
+    a settlement, which is a plain transfer wearing the wrong name.
+    """
+    world = await build_world(session)
+    with pytest.raises(NotACreditCardError):
+        await ledger.settle_card(
+            session,
+            household_id=world.household_id,
+            member_id=world.member_id,
+            card_id=world.cash_id,
+            amount_minor=100_000,
+            occurred_at=JAN_15,
+        )
+
+
+async def test_settle_card_refuses_a_card_with_no_billing_account(
+    session: AsyncSession,
+):
+    """No billing account and no explicit source: raise, never guess.
+
+    Picking any account here would invent where real money came from, and the
+    invented account's balance would be wrong from that moment on.
+    """
+    world = await build_world(session)
+    with pytest.raises(CardHasNoBillingAccountError):
+        await ledger.settle_card(
+            session,
+            household_id=world.household_id,
+            member_id=world.member_id,
+            card_id=world.orphan_card_id,
+            amount_minor=100_000,
+            occurred_at=JAN_15,
+        )
+
+    # Nothing was written on the way to the refusal.
+    assert await ledger.list_entries(session, household_id=world.household_id) == []
+
+
+async def test_explicit_source_beats_the_billing_account(session: AsyncSession):
+    """`billing_account_id` is the default, not a lock.
+
+    The card bills to Savings, but this month it was paid from Cash. The money
+    has to leave the account it actually left, or both balances are wrong.
+    """
+    world = await build_world(session)
+    entry = await ledger.settle_card(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        card_id=world.card_id,
+        amount_minor=250_000,
+        occurred_at=JAN_15,
+        source_account_id=world.cash_id,
+    )
+    await session.commit()
+
+    legs = await ledger.list_legs(
+        session, household_id=world.household_id, entry_id=entry.id
+    )
+    by_role = {leg.leg_role: leg for leg in legs}
+    assert by_role["source"].account_id == world.cash_id
+    assert by_role["destination"].account_id == world.card_id
+
+    cash = await balances.account_balance(
+        session, household_id=world.household_id, account_id=world.cash_id
+    )
+    savings = await balances.account_balance(
+        session, household_id=world.household_id, account_id=world.savings_id
+    )
+    assert cash.balance_minor == -250_000
+    assert savings.balance_minor == 0  # the billing account was not touched
+
+
+async def test_settlement_never_reaches_a_summary(session: AsyncSession):
+    """The purchase is the spending. The settlement is not a second one.
+
+    Counting both would double the money and turn every month you pay a card
+    into a month you overspent — here, PHP 3,000.00 of groceries would report
+    as PHP 6,000.00.
+    """
+    world = await build_world(session)
+    await ledger.create_expense(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        account_id=world.card_id,
+        amount_minor=300_000,
+        occurred_at=JAN_15,
+        category_id=world.groceries_id,
+    )
+    await ledger.settle_card(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        card_id=world.card_id,
+        amount_minor=300_000,
+        occurred_at=FEB_10,
+    )
+    await session.commit()
+
+    jan_start, jan_end = january()
+    jan = await ledger.summarise(
+        session, household_id=world.household_id, start_utc=jan_start, end_utc=jan_end
+    )
+    assert jan.expense_minor == 300_000
+
+    # February is the month the card was paid, and it is an empty month.
+    feb_start, feb_end = february()
+    feb = await ledger.summarise(
+        session, household_id=world.household_id, start_utc=feb_start, end_utc=feb_end
+    )
+    assert feb.expense_minor == 0
+    assert feb.income_minor == 0
+    assert feb.by_category == ()
+
+    # ...and the settlement did move money: the card is back to zero.
+    card = await balances.account_balance(
+        session, household_id=world.household_id, account_id=world.card_id
+    )
+    assert card.balance_minor == 0
+
+
+# --- list_legs --------------------------------------------------------------
+
+
+async def test_list_legs_returns_both_sides_of_a_transfer(session: AsyncSession):
+    """Read back what was written instead of re-deriving it.
+
+    A caller that re-applies the rule which chose the accounts has two
+    implementations of one decision, and they are free to disagree.
+    """
+    world = await build_world(session)
+    transfer = await ledger.create_transfer(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        source_account_id=world.savings_id,
+        destination_account_id=world.cash_id,
+        amount_minor=300_000,
+        occurred_at=JAN_15,
+    )
+    await session.commit()
+
+    legs = await ledger.list_legs(
+        session, household_id=world.household_id, entry_id=transfer.id
+    )
+    assert len(legs) == 2
+    # Ordered by leg_role, so 'destination' comes before 'source'.
+    assert [leg.leg_role for leg in legs] == ["destination", "source"]
+    assert [leg.account_id for leg in legs] == [world.cash_id, world.savings_id]
+    assert [leg.amount_minor for leg in legs] == [300_000, -300_000]
+    assert sum(leg.amount_minor for leg in legs) == 0
+
+
+async def test_list_legs_returns_one_leg_for_an_expense(session: AsyncSession):
+    world = await build_world(session)
+    entry = await ledger.create_expense(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        account_id=world.cash_id,
+        amount_minor=10_000,
+        occurred_at=JAN_15,
+    )
+    await session.commit()
+
+    legs = await ledger.list_legs(
+        session, household_id=world.household_id, entry_id=entry.id
+    )
+    assert len(legs) == 1
+    assert legs[0].leg_role == "source"
+    assert legs[0].account_id == world.cash_id
+    assert legs[0].amount_minor == -10_000
+
+
+async def test_list_legs_is_scoped_to_the_household(session: AsyncSession):
+    """An entry id from another household reads back as nothing, not as legs."""
+    world = await build_world(session)
+    entry = await ledger.create_expense(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        account_id=world.cash_id,
+        amount_minor=10_000,
+        occurred_at=JAN_15,
+    )
+    await session.commit()
+
+    assert (
+        await ledger.list_legs(
+            session,
+            household_id=world.outsider_household_id,
+            entry_id=entry.id,
+        )
+        == []
+    )
+    assert (
+        await ledger.list_legs(
+            session, household_id=world.household_id, entry_id=999_999
+        )
+        == []
+    )
+
+
 # --- list_entries -----------------------------------------------------------
 
 
@@ -747,6 +1002,87 @@ async def test_list_entries_period_is_half_open(session: AsyncSession):
     assert len(in_february) == 1
 
 
+async def test_newest_first_reverses_the_ordering(session: AsyncSession):
+    """The only way to ask for the most recent N.
+
+    Under the default ascending order, `limit=2` returns the two OLDEST entries
+    in range, so "show me what I just logged" cannot be expressed at all.
+    """
+    world = await build_world(session)
+    common = {
+        "household_id": world.household_id,
+        "member_id": world.member_id,
+        "account_id": world.cash_id,
+    }
+    oldest = await ledger.create_expense(
+        session, amount_minor=1_000, occurred_at=JAN_15, **common
+    )
+    middle = await ledger.create_expense(
+        session, amount_minor=2_000, occurred_at=FEB_10, **common
+    )
+    newest = await ledger.create_expense(
+        session, amount_minor=3_000, occurred_at=MAR_20, **common
+    )
+    await session.commit()
+
+    ascending = await ledger.list_entries(session, household_id=world.household_id)
+    assert [e.id for e in ascending] == [oldest.id, middle.id, newest.id]
+
+    descending = await ledger.list_entries(
+        session, household_id=world.household_id, newest_first=True
+    )
+    assert [e.id for e in descending] == [newest.id, middle.id, oldest.id]
+
+    # ...and `limit` now takes from the recent end, which is the whole point.
+    assert [
+        e.id
+        for e in await ledger.list_entries(
+            session, household_id=world.household_id, newest_first=True, limit=2
+        )
+    ] == [newest.id, middle.id]
+    assert [
+        e.id
+        for e in await ledger.list_entries(
+            session, household_id=world.household_id, limit=2
+        )
+    ] == [oldest.id, middle.id]
+
+
+async def test_newest_first_breaks_ties_by_write_order(session: AsyncSession):
+    """Entries sharing a timestamp come back reversed too, not arbitrarily.
+
+    Everything dated `@yesterday` lands on the same Manila midnight, so a tie is
+    the normal case rather than a curiosity. `id` has to fall in the same
+    direction as `occurred_at` or the newest of three same-day entries is
+    whichever one the planner happened to emit first.
+    """
+    world = await build_world(session)
+    common = {
+        "household_id": world.household_id,
+        "member_id": world.member_id,
+        "account_id": world.cash_id,
+        "occurred_at": JAN_15,  # identical for all three
+    }
+    first = await ledger.create_expense(session, amount_minor=1_000, **common)
+    second = await ledger.create_expense(session, amount_minor=2_000, **common)
+    third = await ledger.create_expense(session, amount_minor=3_000, **common)
+    await session.commit()
+
+    descending = await ledger.list_entries(
+        session, household_id=world.household_id, newest_first=True
+    )
+    assert [e.id for e in descending] == [third.id, second.id, first.id]
+
+    ascending = await ledger.list_entries(session, household_id=world.household_id)
+    assert [e.id for e in ascending] == [first.id, second.id, third.id]
+
+    # The most recent single entry is the last one written, not any of the ties.
+    latest = await ledger.list_entries(
+        session, household_id=world.household_id, newest_first=True, limit=1
+    )
+    assert [e.id for e in latest] == [third.id]
+
+
 # --- summarise --------------------------------------------------------------
 
 
@@ -781,8 +1117,24 @@ async def test_summarise_excludes_transfers(session: AsyncSession):
 
 async def test_summarise_ignores_exclude_from_totals(session: AsyncSession):
     """Money spent from an excluded account is still spending. That flag is
-    balance-only; a summary must never consult it."""
+    balance-only; a summary must never consult it.
+
+    A second, NON-excluded account moves too, and net worth is read as a
+    movement from where the household started. A bare `net == 0` proved nothing:
+    zero is what you get when the flag is honoured, and equally what you get
+    when net worth counts nothing at all — and it only held while every factory
+    account happened to open at zero, which nothing enforces.
+    """
     world = await build_world(session)
+    opening_net = await balances.net_worth_minor(
+        session, household_id=world.household_id
+    )
+    opening_excluded = (
+        await balances.account_balance(
+            session, household_id=world.household_id, account_id=world.excluded_id
+        )
+    ).balance_minor
+
     await ledger.create_expense(
         session,
         household_id=world.household_id,
@@ -791,6 +1143,15 @@ async def test_summarise_ignores_exclude_from_totals(session: AsyncSession):
         amount_minor=25_000,
         occurred_at=JAN_15,
     )
+    await ledger.create_income(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        account_id=world.cash_id,
+        amount_minor=40_000,
+        occurred_at=JAN_15,
+        category_id=world.salary_id,
+    )
     await session.commit()
 
     start, end = january()
@@ -798,10 +1159,19 @@ async def test_summarise_ignores_exclude_from_totals(session: AsyncSession):
         session, household_id=world.household_id, start_utc=start, end_utc=end
     )
     assert summary.expense_minor == 25_000
+    assert summary.income_minor == 40_000
 
-    # ...but it IS left out of net worth.
+    # The spending really did leave the excluded account — it is not missing
+    # from net worth because it was never recorded.
+    excluded = await balances.account_balance(
+        session, household_id=world.household_id, account_id=world.excluded_id
+    )
+    assert excluded.balance_minor - opening_excluded == -25_000
+
+    # ...and net worth keeps only the 40,000 that landed in Cash. 15,000 would
+    # mean the excluded spending leaked in; 0 would mean nothing counted.
     net = await balances.net_worth_minor(session, household_id=world.household_id)
-    assert net == 0
+    assert net - opening_net == 40_000
 
 
 async def test_summarise_reports_income_and_expense_separately(
@@ -1088,10 +1458,18 @@ async def test_net_worth_includes_deactivated_accounts(session: AsyncSession):
     owes. Dropping it from net worth would make the household appear PHP
     3,000.00 richer at the exact moment it stopped using the card, with the
     debt sitting untouched in the ledger the whole time.
+
+    Every figure is measured against the accounts under test — the card's own
+    balance and the total before the change — rather than an absolute. The
+    absolutes only worked because the factory opens every account at zero, which
+    is a fixture detail and not a rule.
     """
     from core.models import Account
 
     world = await build_world(session)
+    opening_net = await balances.net_worth_minor(
+        session, household_id=world.household_id
+    )
     await ledger.create_expense(
         session,
         household_id=world.household_id,
@@ -1101,24 +1479,31 @@ async def test_net_worth_includes_deactivated_accounts(session: AsyncSession):
         occurred_at=JAN_15,
     )
     await session.commit()
-    assert (
-        await balances.net_worth_minor(session, household_id=world.household_id)
-    ) == -300_000
+    owing = await balances.net_worth_minor(session, household_id=world.household_id)
+    assert owing - opening_net == -300_000
 
     card = await session.scalar(select(Account).where(Account.id == world.card_id))
     card.is_active = False
     await session.commit()
 
+    # Not "still -300,000" — still the SAME total. Closing an account moves no
+    # money at all, so nothing about this number may change.
     assert (
         await balances.net_worth_minor(session, household_id=world.household_id)
-    ) == -300_000
+    ) == owing
 
-    # ...and `exclude_from_totals` is still the one flag that does remove it.
+    # ...and `exclude_from_totals` is still the one flag that does remove it:
+    # the total drops by exactly the card's own balance, debt and opening alike.
+    card_balance = (
+        await balances.account_balance(
+            session, household_id=world.household_id, account_id=world.card_id
+        )
+    ).balance_minor
     card.exclude_from_totals = True
     await session.commit()
     assert (
         await balances.net_worth_minor(session, household_id=world.household_id)
-    ) == 0
+    ) == owing - card_balance
 
 
 async def test_opening_balance_is_part_of_the_derived_balance(

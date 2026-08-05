@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core import balances, ledger
-from core.models import Entry
+from core.models import Account, Entry
 from core.periods import resolve
 from tests.factories import FEB_10, JAN_15, build_world
 
@@ -240,6 +240,12 @@ async def test_a_full_month_of_activity_reconciles(session: AsyncSession):
     """Income, spending, a transfer and a correction, all in one month.
 
     Balances and the summary must agree on what happened.
+
+    The household does not start from nothing, and every figure below is a
+    MOVEMENT measured against where the accounts under test began. Asserting
+    absolute balances would only work while every account happens to open at
+    zero — true of the factory today, enforced nowhere, and the January the
+    ledger has to survive is never the first one.
     """
     world = await build_world(session)
     common = {
@@ -247,6 +253,30 @@ async def test_a_full_month_of_activity_reconciles(session: AsyncSession):
         "member_id": world.member_id,
         "occurred_at": JAN_15,
     }
+
+    cash_account = await session.scalar(
+        select(Account).where(Account.id == world.cash_id)
+    )
+    savings_account = await session.scalar(
+        select(Account).where(Account.id == world.savings_id)
+    )
+    cash_account.opening_balance_minor = 200_000
+    savings_account.opening_balance_minor = 1_500_000
+    await session.commit()
+
+    opening_net = await balances.net_worth_minor(
+        session, household_id=world.household_id
+    )
+    opening_cash = (
+        await balances.account_balance(
+            session, household_id=world.household_id, account_id=world.cash_id
+        )
+    ).balance_minor
+    opening_savings = (
+        await balances.account_balance(
+            session, household_id=world.household_id, account_id=world.savings_id
+        )
+    ).balance_minor
 
     await ledger.create_income(
         session, account_id=world.cash_id, amount_minor=4_500_000, **common
@@ -293,10 +323,14 @@ async def test_a_full_month_of_activity_reconciles(session: AsyncSession):
         session, household_id=world.household_id, account_id=world.savings_id
     )
     # cash: +4,500,000 income  -125,050 groceries  -1,000,000 transfer out
-    assert cash.balance_minor == 4_500_000 - 125_050 - 1_000_000
+    assert cash.balance_minor - opening_cash == 4_500_000 - 125_050 - 1_000_000
     # savings: +1,000,000 transfer in  -32,000 the reassigned lunch
-    assert savings.balance_minor == 1_000_000 - 32_000
+    assert savings.balance_minor - opening_savings == 1_000_000 - 32_000
 
     net = await balances.net_worth_minor(session, household_id=world.household_id)
-    assert net == cash.balance_minor + savings.balance_minor
-    assert net == summary.income_minor - summary.expense_minor
+    # The transfer nets to zero across the two accounts, so the only thing that
+    # moved net worth is the month's income less its spending.
+    assert net - opening_net == summary.income_minor - summary.expense_minor
+    assert net - opening_net == (cash.balance_minor - opening_cash) + (
+        savings.balance_minor - opening_savings
+    )
