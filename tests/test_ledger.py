@@ -617,6 +617,50 @@ async def test_transfer_tags_do_not_leak_onto_the_fee(session: AsyncSession):
     assert kept == ["topup"]
 
 
+async def test_settle_card_keeps_its_tags(session: AsyncSession):
+    """`/pay 3000 #visa` has to arrive at the ledger with the tag still on it.
+
+    A settlement is a transfer, so it carries no category and a tag is the only
+    label it can hold — the same argument as `test_transfer_tags_survive_a_commit`,
+    and the reason `settle_card` cannot be the one write that quietly drops them.
+    The parser found the tag and the pending row stored it; a settlement that
+    lost it here would make the tag findable on every account except the card.
+    """
+    world = await build_world(session)
+    entry = await ledger.settle_card(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        card_id=world.card_id,
+        amount_minor=300_000,
+        occurred_at=JAN_15,
+        tags=["Visa", "visa", "Statement"],
+    )
+    await session.commit()
+
+    rows = (
+        await session.execute(
+            select(EntryTag.tag, EntryTag.origin, EntryTag.confidence)
+            .where(EntryTag.entry_id == entry.id)
+            .order_by(EntryTag.tag)
+        )
+    ).all()
+    # Lowercased and de-duplicated by the same `_add_tags` every other write uses.
+    assert [tag for tag, _, _ in rows] == ["statement", "visa"]
+    assert all(origin == "manual" for _, origin, _ in rows)
+
+    # Still a transfer, and still the settlement it was: money left Savings —
+    # the card's billing account — and landed on the card.
+    assert entry.kind == "transfer"
+    legs = await ledger.list_legs(
+        session, household_id=world.household_id, entry_id=entry.id
+    )
+    by_role = {leg.leg_role: leg for leg in legs}
+    assert by_role["source"].account_id == world.savings_id
+    assert by_role["destination"].account_id == world.card_id
+    assert sum(leg.amount_minor for leg in legs) == 0
+
+
 # --- list_entries -----------------------------------------------------------
 
 

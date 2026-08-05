@@ -80,10 +80,21 @@ def format_date(moment: dt.datetime) -> str:
     return f"{local.day} {local:%b %Y}"
 
 
+# Keyed by `entries.kind` — what the ledger wrote. A settlement appears here as
+# "Transfer", because that is what it is.
 KIND_LABELS = {
     "expense": "Expense",
     "income": "Income",
     "transfer": "Transfer",
+}
+
+# Keyed by `pending_entries.intent` — what the user asked for, before anything
+# is written. A superset of KIND_LABELS: a settlement is still called a
+# settlement while it is being asked about, which is the whole reason the two
+# vocabularies are not one.
+INTENT_LABELS = {
+    **KIND_LABELS,
+    "settlement": "Settlement",
 }
 
 # Rendered next to an account name so a keyboard scans at a glance. Keys are

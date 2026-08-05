@@ -48,6 +48,9 @@ class ClaimedPending:
     household_id: int
     member_id: int
     raw_input: str
+    # Which flow this was, as recorded when it started. The caller commits on
+    # this, never on which columns happen to be NULL.
+    intent: str
     parsed_kind: str | None
     parsed_amount_minor: int | None
     parsed_category_id: int | None
@@ -68,6 +71,7 @@ _RETURNED = (
     PendingEntry.household_id,
     PendingEntry.member_id,
     PendingEntry.raw_input,
+    PendingEntry.intent,
     PendingEntry.parsed_kind,
     PendingEntry.parsed_amount_minor,
     PendingEntry.parsed_category_id,
@@ -85,6 +89,7 @@ async def create(
     household_id: int,
     member_id: int,
     raw_input: str,
+    intent: str,
     parsed_kind: str,
     parsed_amount_minor: int,
     occurred_at: dt.datetime,
@@ -94,6 +99,12 @@ async def create(
     now: dt.datetime | None = None,
 ) -> PendingEntry:
     """Park a parsed message until an account is chosen.
+
+    `intent` is required and has no default. It is the flow's identity — which
+    question the keyboard is asking — and every later step reads it instead of
+    guessing from which columns are still NULL. A default here would put the
+    guess back, one layer down. `parsed_kind` is a different fact: the ledger
+    kind the entry commits as, which for a settlement is `transfer`.
 
     `now` is injectable so a test can age a row without waiting a day.
 
@@ -118,6 +129,7 @@ async def create(
         household_id=household_id,
         member_id=member_id,
         raw_input=raw_input,
+        intent=intent,
         parsed_kind=parsed_kind,
         parsed_amount_minor=parsed_amount_minor,
         parsed_category_id=parsed_category_id,
@@ -199,6 +211,7 @@ async def claim(
         household_id=row.household_id,
         member_id=row.member_id,
         raw_input=row.raw_input,
+        intent=row.intent,
         parsed_kind=row.parsed_kind,
         parsed_amount_minor=row.parsed_amount_minor,
         parsed_category_id=row.parsed_category_id,

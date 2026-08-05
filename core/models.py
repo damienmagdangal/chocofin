@@ -40,6 +40,12 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 # --- vocabulary -------------------------------------------------------------
 
 ENTRY_KINDS = ("income", "expense", "transfer")
+# What the user ASKED FOR, which is not always what the ledger writes. A card
+# settlement commits as kind='transfer' and always will; "settlement" records
+# that the question on screen was "which card?", not "which account?". The two
+# are different facts and a row that stores only the first cannot answer the
+# second.
+PENDING_INTENTS = ("expense", "income", "transfer", "settlement")
 CATEGORY_KINDS = ("income", "expense")
 LEG_ROLES = ("source", "destination")
 MEMBER_ROLES = ("owner", "member")
@@ -484,7 +490,17 @@ class PendingEntry(Base):
     )
     member_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     raw_input: Mapped[str] = mapped_column(Text, nullable=False)
+    # WHICH FLOW this row belongs to — the question the keyboard is asking.
+    # NOT NULL alone among the columns here, because every other one describes
+    # what was parsed and this one describes what was asked; a row that does not
+    # know which flow it is cannot render its own next keyboard. `/pay` and
+    # `/transfer` produce identical `parsed_*` columns, so without this the only
+    # difference between a settlement and a plain transfer lives in buttons that
+    # have already been sent.
+    intent: Mapped[str] = mapped_column(Text, nullable=False)
     parsed_amount_minor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # The LEDGER KIND this commits as. A settlement is 'transfer' here and
+    # 'settlement' in `intent`; never conflate the two.
     parsed_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
     parsed_category_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     parsed_note: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -504,6 +520,10 @@ class PendingEntry(Base):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            _in("intent", PENDING_INTENTS),
+            name="ck_pending_entries_intent",
+        ),
         CheckConstraint(
             f"parsed_kind IS NULL OR {_in('parsed_kind', ENTRY_KINDS)}",
             name="ck_pending_entries_kind",

@@ -378,6 +378,7 @@ async def settle_card(
     description: str | None = None,
     source: EntrySource = "telegram",
     raw_input: str | None = None,
+    tags: Sequence[str | TagSpec] = (),
 ) -> Entry:
     """Pay down a credit card. A TRANSFER, never an expense.
 
@@ -394,6 +395,12 @@ async def settle_card(
     `billing_account_id` is used; if there is neither, this raises rather than
     picking an account, because inventing where the money came from is a lie
     about real money.
+
+    `tags` are forwarded to the transfer for the reason given on
+    `create_transfer`: a transfer carries no category, so a tag is the only
+    label it can hold. Dropping them here would mean `/pay 3000 #visa` parses a
+    tag, stores it, and loses it at the last step — the tag would exist for
+    every account except the one the user actually names when settling.
 
     The card's statement cycle — closing dates, minimum due, what is even in
     this month's bill — is deliberately not modelled here.
@@ -424,6 +431,7 @@ async def settle_card(
         description=description,
         source=source,
         raw_input=raw_input,
+        tags=tags,
     )
 
 

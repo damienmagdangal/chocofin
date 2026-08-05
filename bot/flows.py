@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot import callbacks, keyboards
 from bot.auth import Actor
 from bot.formatting import (
+    INTENT_LABELS,
     KIND_LABELS,
     account_label,
     esc,
@@ -139,8 +140,15 @@ def _strip_command(raw: str) -> str:
     return raw.strip()
 
 
-def _describe(parsed_kind: str, amount_minor: int, note: str | None) -> str:
-    label = KIND_LABELS.get(parsed_kind, parsed_kind.title())
+def _describe(intent: str, amount_minor: int, note: str | None) -> str:
+    """The header above a keyboard, named for what the user ASKED for.
+
+    Keyed on `intent`, not on the ledger kind: while the question is still on
+    screen a settlement is a settlement, and calling it "Transfer" here would
+    describe the row by what it is about to become rather than by what was
+    asked. `KIND_LABELS` still names entries once they exist.
+    """
+    label = INTENT_LABELS.get(intent, intent.title())
     body = f"<b>{label} {format_minor(amount_minor)}</b>"
     if note:
         body += f"\n{esc(note)}"
@@ -221,6 +229,10 @@ async def start_entry(
         household_id=actor.household_id,
         member_id=actor.member_id,
         raw_input=raw,
+        # Nothing was overridden here, so the intent and the ledger kind are the
+        # same word. They are still written separately: they answer different
+        # questions, and the two commands below are where they diverge.
+        intent=parsed.kind,
         parsed_kind=parsed.kind,
         parsed_amount_minor=parsed.amount_minor,
         parsed_note=parsed.note or None,
@@ -261,6 +273,7 @@ async def start_transfer(
         household_id=actor.household_id,
         member_id=actor.member_id,
         raw_input=raw,
+        intent="transfer",
         # The parser read this as an expense because that is its default; the
         # command said otherwise and the command wins.
         parsed_kind="transfer",
@@ -311,6 +324,10 @@ async def start_settlement(
         household_id=actor.household_id,
         member_id=actor.member_id,
         raw_input=raw,
+        # The two facts that a single column could not hold. This commits as a
+        # transfer — a settlement always does — but what was ASKED was "which
+        # card?", and every later step needs to know that to ask it again.
+        intent="settlement",
         parsed_kind="transfer",
         parsed_amount_minor=parsed.amount_minor,
         parsed_note=parsed.note or None,
@@ -319,7 +336,7 @@ async def start_settlement(
         now=now,
     )
 
-    header = f"<b>Settlement {format_minor(parsed.amount_minor)}</b>" + _dated(
+    header = _describe("settlement", parsed.amount_minor, parsed.note) + _dated(
         occurred_at, now
     )
     return await _account_choice(
@@ -370,14 +387,14 @@ async def commit_account_choice(
     if claimed.is_expired(now):
         return Reply(text=EXPIRED, toast=EXPIRED, edit=True)
 
-    if claimed.parsed_kind == "expense":
+    if claimed.intent == "expense":
         write = ledger.create_expense
-    elif claimed.parsed_kind == "income":
+    elif claimed.intent == "income":
         write = ledger.create_income
     else:
-        # A transfer reached the single-leg button. Our own keyboards never do
-        # this, so it is a hand-made payload; refuse rather than guess which
-        # half of the transfer was meant.
+        # A transfer or a settlement reached the single-leg button. Our own
+        # keyboards never do this, so it is a hand-made payload; refuse rather
+        # than guess which half of the transfer was meant.
         return Reply(text=GONE, toast=GONE, edit=True)
 
     try:
@@ -417,6 +434,11 @@ async def pick_transfer_source(
     The choice goes onto the pending ROW, not into this process. The user can
     close Telegram, the service can be redeployed, and the second keyboard
     still commits against the account picked before all that.
+
+    Also reached by a settlement whose card named no billing account, where this
+    is the payer being answered. The second question then has to stay "which
+    card?" — the row's `intent` says which flow this is, so the keyboard below
+    keeps the credit-card filter instead of quietly widening to every account.
     """
     row = await pending.get(
         session, household_id=actor.household_id, pending_id=pending_id
@@ -441,8 +463,10 @@ async def pick_transfer_source(
         account_id=account_id,
     )
 
+    settling = row.intent == "settlement"
+    label = INTENT_LABELS.get(row.intent, row.intent.title())
     header = (
-        f"<b>Transfer {format_minor(row.parsed_amount_minor)}</b>\n"
+        f"<b>{label} {format_minor(row.parsed_amount_minor)}</b>\n"
         f"From {esc(account_label(source.name, source.type))}"
     )
     return await _account_choice(
@@ -450,11 +474,13 @@ async def pick_transfer_source(
         actor,
         pending_id=pending_id,
         build_data=callbacks.pick_destination,
-        prompt="To which account?",
+        prompt="Which card?" if settling else "To which account?",
         header=header,
+        types=("credit_card",) if settling else None,
         # A transfer to itself is rejected by core anyway; not offering it is
         # simply a keyboard that cannot ask a question with no good answer.
         exclude=(account_id,),
+        empty_message=NO_CARDS if settling else NO_ACCOUNTS,
         edit=True,
     )
 
@@ -469,15 +495,15 @@ async def commit_destination(
 ) -> Reply:
     """A tap on a destination or card button. Writes the transfer.
 
-    Two shapes arrive here and the pending row tells them apart with no rule of
-    this module's own:
+    Which write happens is read from `intent`, never inferred from which
+    columns are still NULL. A settlement stays a settlement all the way to the
+    ledger even when its payer was chosen by hand, and `settle_card` is what
+    checks that the target is a credit card at all — a check that used to be
+    skipped for exactly the flow that most needs it.
 
-    * a source is already stored — the user has picked both ends, so this is
-      `create_transfer` between them. A settlement whose payer was chosen by
-      hand is exactly that, and produces exactly the same row.
-    * no source — this is `/pay`'s first tap, and `settle_card` resolves the
-      payer from the card's billing account. If the card names none, it says
-      so instead of guessing, and the user is asked who is paying.
+    `source_account_id` is still consulted, but only WITHIN a transfer, where it
+    records how far through a two-tap flow the user is. That is a stored answer,
+    not an identity guessed from an absence.
     """
     claimed = await pending.claim(
         session, household_id=actor.household_id, pending_id=pending_id
@@ -488,7 +514,31 @@ async def commit_destination(
         return Reply(text=EXPIRED, toast=EXPIRED, edit=True)
 
     try:
-        if claimed.source_account_id is not None:
+        if claimed.intent == "settlement":
+            entry = await ledger.settle_card(
+                session,
+                household_id=actor.household_id,
+                member_id=actor.member_id,
+                card_id=account_id,
+                amount_minor=claimed.parsed_amount_minor,
+                occurred_at=claimed.occurred_at,
+                # NULL on the ordinary `/pay` path, where the card's billing
+                # account answers this. Set only when the card named none and
+                # the user was asked. Either way the rule about who pays stays
+                # in core, and either way the target is checked for being a card.
+                source_account_id=claimed.source_account_id,
+                note=claimed.parsed_note,
+                source="telegram",
+                raw_input=claimed.raw_input,
+                tags=claimed.parsed_tags,
+            )
+        elif claimed.source_account_id is None:
+            # A destination button on a transfer whose source was never chosen.
+            # Our keyboards cannot produce that — `pick_transfer_source` is the
+            # only thing that sends one — so it is a hand-made payload. Refuse
+            # rather than guess which half of the transfer was meant.
+            return Reply(text=GONE, toast=GONE, edit=True)
+        else:
             entry = await ledger.create_transfer(
                 session,
                 household_id=actor.household_id,
@@ -501,18 +551,6 @@ async def commit_destination(
                 source="telegram",
                 raw_input=claimed.raw_input,
                 tags=claimed.parsed_tags,
-            )
-        else:
-            entry = await ledger.settle_card(
-                session,
-                household_id=actor.household_id,
-                member_id=actor.member_id,
-                card_id=account_id,
-                amount_minor=claimed.parsed_amount_minor,
-                occurred_at=claimed.occurred_at,
-                note=claimed.parsed_note,
-                source="telegram",
-                raw_input=claimed.raw_input,
             )
     except CardHasNoBillingAccountError:
         # Recoverable, and the only branch that puts the row back. Re-creating
@@ -563,12 +601,23 @@ async def _reopen_for_payer(
 
     The claimed row was deleted by the claim; a fresh one carries the same
     amount, note and date forward so the user is not asked to retype anything.
+    It stays `intent='settlement'`, because the user asked to settle a card and
+    being asked a second question does not change that. The commit still goes
+    through `settle_card`, so the target is still checked for being a card.
+
+    The keyboard is the FULL account list rather than the MRU shortlist, so it
+    carries no [Other…] button. That is the point. A settlement with no source
+    yet is the one state `intent` cannot disambiguate — it means "waiting for
+    the card" on the `/pay` path and "waiting for the payer" here — and [Other…]
+    would have to re-derive which. Removing the button removes the ambiguity
+    instead of adding a rule that guesses at it.
     """
     row = await pending.create(
         session,
         household_id=actor.household_id,
         member_id=actor.member_id,
         raw_input=claimed.raw_input,
+        intent="settlement",
         parsed_kind="transfer",
         parsed_amount_minor=claimed.parsed_amount_minor,
         parsed_note=claimed.parsed_note,
@@ -588,6 +637,7 @@ async def _reopen_for_payer(
         prompt="Which account is paying?",
         header=header,
         edit=True,
+        show_all=True,
     )
 
 
@@ -598,7 +648,20 @@ async def show_all_accounts(
     pending_id: int,
     now: dt.datetime,
 ) -> Reply:
-    """[Other…]: the same question, with every account on screen."""
+    """[Other…]: the SAME question, with every account on screen.
+
+    The same question. This used to reconstruct which question that was from
+    `parsed_kind` plus a NULL source, and got `/pay` wrong: a settlement has
+    `parsed_kind='transfer'` and no source, so tapping [Other…] on a card
+    keyboard re-asked "From which account?" with a source-picking builder and
+    without the credit-card filter. Two taps later the settlement had become a
+    plain transfer into whatever account was on the list, and nothing on the
+    path had checked that it was a card.
+
+    `intent` says which flow this is, so the question does not have to be
+    guessed. Within a transfer, `source_account_id` still says how far through
+    the two taps the user is — a stored answer, not an inferred identity.
+    """
     row = await pending.get(
         session, household_id=actor.household_id, pending_id=pending_id
     )
@@ -607,23 +670,35 @@ async def show_all_accounts(
     if now >= row.expires_at:
         return Reply(text=EXPIRED, toast=EXPIRED, edit=True)
 
-    if row.parsed_kind != "transfer":
+    types: Sequence[str] | None = None
+    empty_message = NO_ACCOUNTS
+    # Whatever the money is already known to be leaving. Not offered as a
+    # destination on any flow: an account cannot pay itself, and core rejects it
+    # anyway, so a button for it could only ask a question with no good answer.
+    chosen: tuple[int, ...] = (
+        () if row.source_account_id is None else (row.source_account_id,)
+    )
+    if row.intent == "settlement":
+        # Always the card question. The payer question of `_reopen_for_payer`
+        # cannot arrive here — that keyboard is sent without an [Other…].
+        build_data = callbacks.pick_destination
+        prompt = "Which card?"
+        types = ("credit_card",)
+        empty_message = NO_CARDS
+        exclude = chosen
+    elif row.intent == "transfer":
+        if row.source_account_id is None:
+            build_data = callbacks.pick_source
+            prompt = "From which account?"
+            exclude = ()
+        else:
+            build_data = callbacks.pick_destination
+            prompt = "To which account?"
+            exclude = chosen
+    else:
         build_data = callbacks.pick_account
         prompt = "Which account?"
-        exclude: tuple[int, ...] = ()
-        header = _describe(
-            row.parsed_kind or "expense", row.parsed_amount_minor or 0, row.parsed_note
-        )
-    elif row.source_account_id is None:
-        build_data = callbacks.pick_source
-        prompt = "From which account?"
         exclude = ()
-        header = f"<b>Transfer {format_minor(row.parsed_amount_minor or 0)}</b>"
-    else:
-        build_data = callbacks.pick_destination
-        prompt = "To which account?"
-        exclude = (row.source_account_id,)
-        header = f"<b>Transfer {format_minor(row.parsed_amount_minor or 0)}</b>"
 
     return await _account_choice(
         session,
@@ -631,8 +706,10 @@ async def show_all_accounts(
         pending_id=pending_id,
         build_data=build_data,
         prompt=prompt,
-        header=header,
+        header=_describe(row.intent, row.parsed_amount_minor or 0, row.parsed_note),
+        types=types,
         exclude=exclude,
+        empty_message=empty_message,
         edit=True,
         show_all=True,
     )
