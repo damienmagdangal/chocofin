@@ -16,6 +16,15 @@ still there?" and "take it", because those are one statement. The caller runs
 without its pending row disappearing, and the pending row cannot disappear
 without an entry being written.
 
+That WHERE clause also names the MEMBER, not just the household. A pending row
+belongs to the person who typed the message, and only they can answer it. The
+household alone is not enough scope: a household is a shared Telegram chat, so
+its members can all see each other's keyboards and tap them. Whoever taps would
+otherwise be recorded as having spent the money, and their own recent-accounts
+shortlist would learn from an entry they never made. Ownership and atomicity are
+both properties of the same single statement, which is why neither needs a check
+in front of it.
+
 `claim` returns a frozen snapshot rather than the ORM object. The row is gone
 by the time the caller sees it; handing back a live instance mapped to a
 deleted row is a trap that eventually loads or flushes something that is not
@@ -148,35 +157,61 @@ async def create(
 
 
 async def get(
-    session: AsyncSession, *, household_id: int, pending_id: int
+    session: AsyncSession, *, household_id: int, member_id: int, pending_id: int
 ) -> PendingEntry | None:
     """Read a pending row without taking it.
 
     For rendering the next keyboard only. Never read-then-write: that is the
     race `claim` exists to close.
+
+    Scoped to the member as well as the household, so a housemate cannot read
+    the state of a flow they did not start. `member_id` is required and has no
+    default: a default meaning "any member" is exactly the gap this closes,
+    re-entered through a parameter.
     """
     return await session.scalar(
         select(PendingEntry).where(
             PendingEntry.id == pending_id,
             PendingEntry.household_id == household_id,
+            PendingEntry.member_id == member_id,
         )
     )
 
 
 async def set_source_account(
-    session: AsyncSession, *, household_id: int, pending_id: int, account_id: int
+    session: AsyncSession,
+    *,
+    household_id: int,
+    member_id: int,
+    pending_id: int,
+    account_id: int,
 ) -> bool:
     """Record a transfer's source account between the two keyboard taps.
 
     Returns False if the row is gone — cancelled, expired, or already claimed
     by a competing tap. The caller reports that rather than carrying on with a
     transfer whose first half no longer exists.
+
+    False too when the row belongs to a different member. A transfer is two taps
+    with a gap between them, and the member predicate is what stops a housemate
+    steering the half they can see: without it, whoever taps first picks where
+    someone else's money leaves from.
+
+    Also False when the row is not a two-leg flow at all. Only a transfer or a
+    settlement has a source to remember; an expense or an income names its one
+    account on the tap that commits it. Writing a source onto one of those would
+    make it indistinguishable from a half-finished transfer, and the next tap
+    would commit it as `kind='transfer'` — money the user called spending,
+    filtered out of every spending total. The bot refuses that payload before
+    it reaches here; this WHERE clause is why no other caller can reintroduce it.
     """
     result = await session.execute(
         update(PendingEntry)
         .where(
             PendingEntry.id == pending_id,
             PendingEntry.household_id == household_id,
+            PendingEntry.member_id == member_id,
+            PendingEntry.intent.in_(("transfer", "settlement")),
         )
         .values(source_account_id=account_id)
     )
@@ -184,13 +219,17 @@ async def set_source_account(
 
 
 async def claim(
-    session: AsyncSession, *, household_id: int, pending_id: int
+    session: AsyncSession, *, household_id: int, member_id: int, pending_id: int
 ) -> ClaimedPending | None:
     """Atomically take a pending row, or return None if someone already did.
 
-    None means: double tap, a button from a flow that was cancelled, or a
-    message from before a `/void`-and-retry. All three are the same answer —
-    do nothing and say so — which is why they are not distinguished here.
+    None means: double tap, a button from a flow that was cancelled, a message
+    from before a `/void`-and-retry, or a tap from a member who is not the one
+    who typed it. All four are the same answer — do nothing and say so — which
+    is why they are not distinguished here. The last one is deliberately
+    indistinguishable from the others at the caller: a housemate tapping a
+    button that is not theirs learns nothing about what anyone else is midway
+    through.
 
     An EXPIRED row is still returned, and still deleted. The caller checks
     `is_expired` and refuses. Filtering expiry into the WHERE clause instead
@@ -202,6 +241,7 @@ async def claim(
         .where(
             PendingEntry.id == pending_id,
             PendingEntry.household_id == household_id,
+            PendingEntry.member_id == member_id,
         )
         .returning(*_RETURNED)
         .execution_options(synchronize_session=False)
@@ -227,8 +267,21 @@ async def claim(
     )
 
 
-async def cancel(session: AsyncSession, *, household_id: int, pending_id: int) -> bool:
-    """Discard a pending row. True if this call is the one that removed it."""
+async def cancel(
+    session: AsyncSession, *, household_id: int, member_id: int, pending_id: int
+) -> bool:
+    """Discard a pending row. True if this call is the one that removed it.
+
+    Still `claim` underneath, so the member scope comes along with it and there
+    is exactly one statement in this module that takes a row. Cancelling records
+    nothing, but a housemate cancelling someone else's keyboard would still make
+    their entry vanish mid-flow with no explanation.
+    """
     return (
-        await claim(session, household_id=household_id, pending_id=pending_id)
+        await claim(
+            session,
+            household_id=household_id,
+            member_id=member_id,
+            pending_id=pending_id,
+        )
     ) is not None

@@ -42,7 +42,13 @@ async def _post_shutdown(application: Application) -> None:
 
 
 async def _on_error(update: object, context) -> None:
-    """Log and move on. One bad update must not stop the poller."""
+    """Log and move on. One bad update must not stop the poller.
+
+    THE place a handler traceback is printed. `bot.auth` catches the same
+    exception first — it has to, to roll back and reply — but logs only the
+    handler's name before re-raising, so each failure leaves one stack here
+    rather than two identical ones at two levels.
+    """
     logger.exception("update failed", exc_info=context.error)
 
 

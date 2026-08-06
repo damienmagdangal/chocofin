@@ -27,14 +27,24 @@ Conflating them is what caused the bug, and giving each fact its own column is
 what stops it coming back.
 
 DESTRUCTIVE-OPERATION NOTE, per .claude/rules/migrations.md: this adds a NOT
-NULL column with no server default and no backfill. That is free today and only
-today — `pending_entries` is empty in every environment, because the bot has
-never run. It is written this way on purpose. A DEFAULT would let a future row
-be created without an intent and quietly inherit someone's guess, and a backfill
+NULL column with no server default and no backfill, and clears `pending_entries`
+first.
+
+The column is written that way on purpose. A DEFAULT would let a future row be
+created without an intent and quietly inherit someone's guess, and a backfill
 would have to decide `settlement` vs `transfer` for rows that by definition
 cannot tell you which they were — which is the exact ambiguity this column
-exists to remove. On a populated table this migration fails loudly, which is the
-correct outcome: it should be a decision, not a silent default.
+exists to remove.
+
+That leaves the existing rows, and the DELETE is what handles them. Adding a NOT
+NULL column with no default to a populated table simply fails, and any database
+where the bot has run has rows here — the earlier claim that this table is empty
+in every environment was true when it was written and nothing keeps it true. So
+the rows go. A `pending_entries` row is an unanswered keyboard: an amount that
+has been parsed and is waiting for someone to tap an account. It has never
+moved money, no `entries` row depends on it, and the worst it costs is retyping
+"120 coffee". The migrations rule that forbids a data migration scopes itself to
+`entries`, which this does not touch.
 
 Revision ID: 0004_pending_entry_intent
 Revises: 0003_pending_entry_columns
@@ -53,6 +63,9 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    # Unanswered keyboards, cleared so the NOT NULL column can be added without
+    # inventing an intent for them. See the note above.
+    op.execute("DELETE FROM pending_entries")
     op.add_column(
         "pending_entries",
         sa.Column("intent", sa.Text(), nullable=False),
@@ -68,6 +81,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Same DELETE, for the same reason in the other direction: every row here
+    # was written knowing which question it was asking, the older schema cannot
+    # hold that, and leaving the rows would make the next `upgrade` fail on
+    # exactly the rows this revision has just stripped the intent from.
+    op.execute("DELETE FROM pending_entries")
     # Dropping the column would take the constraint with it, but naming it here
     # keeps the reversal explicit rather than incidental.
     op.drop_constraint("ck_pending_entries_intent", "pending_entries", type_="check")

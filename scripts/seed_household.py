@@ -16,7 +16,15 @@ Reads `DATABASE_URL` through `core.config`, like everything else. It is NOT an
 onboarding feature — there is no rule here for a later phase to unwind. It is a
 typed-in INSERT with a `--help`, and it is re-runnable: an existing
 `telegram_user_id`, household name or account name is left alone rather than
-duplicated.
+duplicated, and a card that already names a billing account keeps the one it
+has — a re-run reports the difference instead of repointing it.
+
+It prints the database it is about to write to and asks before writing.
+`DATABASE_URL` is ambient and this is the one script that can point a Telegram
+account at a household: `telegram_user_id` is globally UNIQUE, and `seed` binds
+an unknown one to whichever household it was pointed at. Getting that wrong is
+not data loss, it is access, and the script cannot undo it on a later run.
+`--yes` skips the question for scripted use; nothing skips the echo.
 """
 
 from __future__ import annotations
@@ -24,10 +32,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.config import get_settings
 from core.db import make_engine, make_sessionmaker, session_scope
 from core.models import ACCOUNT_TYPES, Account, Household, Member
 
@@ -52,6 +62,82 @@ def _parse_account(spec: str) -> tuple[str, str, str | None]:
             f"{name!r} is a {account_type}, so it cannot have a billing account"
         )
     return name, account_type, billing
+
+
+def _redact(url: str) -> str:
+    """The connection string with the password taken out.
+
+    The target has to be printed and the URL carries a password. The netloc is
+    rebuilt from its parsed parts rather than cut out of the string, so a
+    password containing an `@` or a `:` cannot survive the edit.
+    """
+    parts = urlsplit(url)
+    netloc = parts.hostname or ""
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    if parts.username:
+        netloc = f"{parts.username}@{netloc}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def _database_name(url: str) -> str:
+    """Same read as `tests/conftest.py`, which guards on the same thing."""
+    return urlsplit(url).path.lstrip("/")
+
+
+def _interactive() -> bool:
+    """Whether there is a person on the other end to answer the prompt."""
+    return sys.stdin.isatty()
+
+
+def _confirm(
+    url: str,
+    *,
+    household_name: str,
+    telegram_user_id: int,
+    display_name: str,
+    account_specs: list[tuple[str, str, str | None]],
+    assume_yes: bool,
+) -> bool:
+    """Show the operator where this is pointed and what it will write.
+
+    The prompt asks for the database name rather than a `y`, because a `y` can
+    be typed without reading the line above it and the name cannot. The whole
+    point of the question is that the echo gets looked at.
+    """
+    name = _database_name(url)
+    print("About to write to")
+    print(f"  {_redact(url)}")
+    print(f"  database: {name or '(none in the URL)'}")
+    print()
+    print(f"  household:        {household_name!r}")
+    print(f"  telegram user id: {telegram_user_id}")
+    print(f"  display name:     {display_name!r}")
+    for account_name, account_type, billing in account_specs:
+        billing_note = f", settles from {billing!r}" if billing else ""
+        print(f"  account:          {account_name!r} ({account_type}){billing_note}")
+    print()
+    print(
+        "telegram_user_id is globally UNIQUE. This grants that Telegram account"
+        " access to this household's ledger, and re-running against a different"
+        " household will not move it."
+    )
+
+    if assume_yes:
+        print("--yes given, so not asking.")
+        return True
+    if not _interactive():
+        print("Not a terminal and --yes was not given, so there is nobody to ask.")
+        return False
+    try:
+        answer = input(f"Type the database name ({name}) to continue: ")
+    except (EOFError, KeyboardInterrupt):
+        # `isatty` is not a promise that anyone will answer — a redirected
+        # stdin reports a terminal under some shells and then reads EOF, and
+        # Ctrl-C is an answer of its own. Silence is a no, not a traceback.
+        print()
+        return False
+    return answer.strip() == name
 
 
 async def _find_account(
@@ -139,6 +225,25 @@ async def seed(
             continue
         if card.billing_account_id == billing.id:
             continue
+        if card.billing_account_id is not None:
+            # A re-run leaves what is already there alone — the same rule the
+            # account and member passes follow, and it matters more here.
+            # `settle_card` reads this column to decide where real money comes
+            # from, so repointing it would send the next `/pay` out of an
+            # account the operator never named, on a script whose log said it
+            # had linked something rather than moved it.
+            current = await session.scalar(
+                select(Account).where(
+                    Account.id == card.billing_account_id,
+                    Account.household_id == household_id,
+                )
+            )
+            current_name = current.name if current else f"#{card.billing_account_id}"
+            log.append(
+                f"{name!r} already settles from {current_name!r}, "
+                f"not {billing_name!r} — left alone"
+            )
+            continue
         card.billing_account_id = billing.id
         log.append(f"{name!r} settles from {billing_name!r}")
 
@@ -167,9 +272,28 @@ async def _main(argv: list[str] | None = None) -> int:
         metavar="NAME:TYPE[:BILLING]",
         help="repeatable; e.g. Cash:cash, Visa:credit_card:BPI",
     )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the confirmation, for scripted use. The target is still printed.",
+    )
     args = parser.parse_args(argv)
 
-    engine = make_engine()
+    # Resolved once, here, so the operator is shown the exact URL the engine
+    # will be built from — and so a declined run never builds one at all.
+    url = get_settings().database_url
+    if not _confirm(
+        url,
+        household_name=args.household,
+        telegram_user_id=args.telegram_user_id,
+        display_name=args.display_name,
+        account_specs=args.account,
+        assume_yes=args.yes,
+    ):
+        print("Aborted. Nothing was written.")
+        return 1
+
+    engine = make_engine(url)
     try:
         async with session_scope(make_sessionmaker(engine)) as session:
             log = await seed(

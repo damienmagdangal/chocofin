@@ -10,9 +10,10 @@ Two things are deliberately NOT tested here:
 * `_main`'s happy path. It calls `make_engine()`, which reads `DATABASE_URL` —
   the live household. Tests use `TEST_DATABASE_URL` and nothing else, so the
   DB-backed tests below drive `seed()` against the `session` fixture instead.
-  What `_main` uniquely owns is argument parsing, and that is reachable without
-  a database because argparse rejects a bad `--account` before the engine is
-  built.
+  What `_main` uniquely owns is argument parsing and the confirmation guard,
+  and both are reachable without a database: argparse rejects a bad `--account`
+  before the engine is built, and the guard decides whether the engine is built
+  at all. The guard tests below stub `make_engine` to prove exactly that.
 * Anything about `_parse_account` being reached from the command line with a
   *good* spec, for the same reason.
 
@@ -30,9 +31,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core import ledger
+from core.config import Settings
 from core.errors import CardHasNoBillingAccountError
 from core.models import Account, Entry, Household, Member
-from scripts.seed_household import _main, _parse_account, seed
+from scripts import seed_household
+from scripts.seed_household import _main, _parse_account, _redact, seed
 from tests.factories import JAN_15
 
 # One household, one owner, and a card that settles from the bank. The card is
@@ -298,6 +301,32 @@ async def test_a_seeded_card_settles_from_its_billing_account(session: AsyncSess
     )
 
 
+async def test_a_rerun_never_repoints_a_card_that_already_has_a_billing_account(
+    session: AsyncSession,
+):
+    """The same "leave what is there alone" rule the accounts and the member
+    follow, on the one column that decides where money comes from.
+
+    A card linked to BPI, re-run as `Visa:credit_card:Wallet`, used to be
+    repointed in silence and logged with the line that means "linked" — so the
+    next `/pay` would have moved real money out of Wallet, and the log the
+    operator read would have looked like the first run's. It keeps BPI, and the
+    difference is reported.
+    """
+    await _seed(session)
+    bank = await _account(session, "BPI")
+
+    log = await _seed(
+        session, account_specs=[_parse_account("Visa:credit_card:Wallet")]
+    )
+
+    card = await _account(session, "Visa")
+    assert card.billing_account_id == bank.id
+    assert any("left alone" in line and "'BPI'" in line for line in log)
+    # Never the line that claims a link was made.
+    assert not any(line == "'Visa' settles from 'Wallet'" for line in log)
+
+
 async def test_an_unlinked_seeded_card_refuses_to_invent_a_payer(
     session: AsyncSession,
 ):
@@ -322,3 +351,177 @@ async def test_an_unlinked_seeded_card_refuses_to_invent_a_payer(
             amount_minor=250_000,
             occurred_at=JAN_15,
         )
+
+
+# --- the confirmation guard -------------------------------------------------
+#
+# `DATABASE_URL` is ambient, and this script is the only thing that can bind a
+# Telegram account to a household. `telegram_user_id` is globally UNIQUE and
+# `seed` short-circuits on a known one, so aiming this at the wrong database
+# grants access that a later run cannot take back. None of these tests need a
+# database: that is the property under test.
+
+# Invented, like everything else in the fixtures. The password is here so the
+# tests can prove it never reaches stdout.
+FAKE_PASSWORD = "not-a-real-password"
+FAKE_URL = f"postgresql+asyncpg://chocofin:{FAKE_PASSWORD}@db.invalid:5432/chocofin"
+
+
+class _Reached(Exception):
+    """Raised in place of `make_engine`: the guard let this run through."""
+
+
+def _argv(*extra: str) -> list[str]:
+    return [
+        "--household",
+        HOUSEHOLD,
+        "--telegram-user-id",
+        str(TELEGRAM_ID),
+        "--display-name",
+        DISPLAY_NAME,
+        *extra,
+    ]
+
+
+@pytest.fixture
+def guarded(monkeypatch: pytest.MonkeyPatch):
+    """A fixed target, and an engine that announces itself instead of connecting.
+
+    Reaching `make_engine` is exactly what the confirmation is meant to gate,
+    so the fixture makes that reachable event loud rather than letting it try
+    to open a socket.
+    """
+    monkeypatch.setattr(
+        seed_household, "get_settings", lambda: Settings(database_url=FAKE_URL)
+    )
+
+    def reached(*args, **kwargs):
+        raise _Reached
+
+    monkeypatch.setattr(seed_household, "make_engine", reached)
+
+
+def test_redact_prints_the_target_without_the_password():
+    redacted = _redact(FAKE_URL)
+
+    assert FAKE_PASSWORD not in redacted
+    # Still identifies the target, which is the entire point of printing it.
+    assert redacted == "postgresql+asyncpg://chocofin@db.invalid:5432/chocofin"
+
+
+def test_redact_survives_a_password_full_of_url_punctuation():
+    """Cutting the password out with a string edit would leak half of this one."""
+    redacted = _redact("postgresql+asyncpg://user:p@ss:w0rd@host:5432/db")
+
+    assert "p@ss:w0rd" not in redacted
+    assert redacted == "postgresql+asyncpg://user@host:5432/db"
+
+
+async def test_a_declined_confirmation_writes_nothing(
+    guarded, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """The whole point: a wrong answer stops before an engine exists."""
+    monkeypatch.setattr(seed_household, "_interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "chocofin_test")
+
+    assert await _main(_argv()) == 1
+
+    out = capsys.readouterr().out
+    assert "Aborted. Nothing was written." in out
+    assert "created" not in out
+
+
+async def test_the_target_and_what_it_will_write_are_printed_before_the_prompt(
+    guarded, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """The operator has to be able to see they are aimed at the wrong database.
+
+    The Telegram id is the line that matters most — it is the value `seed`
+    short-circuits on, and the one that is awkward to reverse.
+    """
+    monkeypatch.setattr(seed_household, "_interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "")
+
+    assert await _main(_argv("--account", "Wallet:cash")) == 1
+
+    out = capsys.readouterr().out
+    assert "postgresql+asyncpg://chocofin@db.invalid:5432/chocofin" in out
+    assert "database: chocofin" in out
+    assert str(TELEGRAM_ID) in out
+    assert HOUSEHOLD in out
+    assert "'Wallet' (cash)" in out
+    # No secrets on stdout, ever.
+    assert FAKE_PASSWORD not in out
+
+
+async def test_without_a_terminal_it_refuses_rather_than_blocking(
+    guarded, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """A cron job or a piped stdin has nobody to answer, so it must not write.
+
+    Reading from a closed stdin would either hang or take EOF for an answer.
+    """
+    monkeypatch.setattr(seed_household, "_interactive", lambda: False)
+
+    def never(*args, **kwargs):
+        raise AssertionError("prompted with no terminal to prompt")
+
+    monkeypatch.setattr("builtins.input", never)
+
+    assert await _main(_argv()) == 1
+    assert "Aborted. Nothing was written." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("interruption", [EOFError, KeyboardInterrupt])
+async def test_an_unanswered_prompt_is_a_no_rather_than_a_traceback(
+    guarded,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    interruption: type[BaseException],
+):
+    """`isatty` is not a promise that anyone will answer.
+
+    A stdin redirected from /dev/null reports a terminal under some shells and
+    then reads EOF, which crashed the script with a traceback where it should
+    have said it was aborting. Ctrl-C at the prompt is the same situation and
+    the same answer.
+    """
+    monkeypatch.setattr(seed_household, "_interactive", lambda: True)
+
+    def interrupted(_prompt):
+        raise interruption
+
+    monkeypatch.setattr("builtins.input", interrupted)
+
+    assert await _main(_argv()) == 1
+    assert "Aborted. Nothing was written." in capsys.readouterr().out
+
+
+async def test_typing_the_database_name_lets_the_run_through(
+    guarded, monkeypatch: pytest.MonkeyPatch
+):
+    """The other half: a confirmed run does reach the engine."""
+    monkeypatch.setattr(seed_household, "_interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "  chocofin  ")
+
+    with pytest.raises(_Reached):
+        await _main(_argv())
+
+
+async def test_yes_skips_the_question_but_not_the_echo(
+    guarded, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """`--yes` is for scripts. It waives the answer, never the disclosure."""
+
+    def never(*args, **kwargs):
+        raise AssertionError("prompted despite --yes")
+
+    monkeypatch.setattr("builtins.input", never)
+
+    with pytest.raises(_Reached):
+        await _main(_argv("--yes"))
+
+    out = capsys.readouterr().out
+    assert "postgresql+asyncpg://chocofin@db.invalid:5432/chocofin" in out
+    assert "database: chocofin" in out
+    assert FAKE_PASSWORD not in out

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import (
@@ -40,6 +40,11 @@ from core.models import Account, Category, Entry, EntryLeg, EntryTag
 
 EntrySource = Literal["telegram", "web"]
 GroupBy = Literal["parent", "leaf"]
+
+# Which clock a listing is sorted by. Two different questions: `occurred_at` is
+# when the money moved, `created_at` is when the entry was LOGGED. See
+# `list_entries`.
+OrderBy = Literal["occurred_at", "created_at"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,12 +65,16 @@ class TagSpec:
 
     `confidence` is a Numeric(4,3) score, NOT money. It comes back from the
     database as a Decimal and is carried straight through rather than being
-    routed via float, so a round trip cannot perturb it.
+    routed via float, so a round trip cannot perturb it — which is why the
+    default is a Decimal too. A float default would be the one value in the
+    column that this class itself put through binary floating point, in a
+    docstring that says it never does. A caller may still pass a float and is
+    accepted as given; that is the caller's number, not this class's.
     """
 
     tag: str
     origin: str = "manual"
-    confidence: Decimal | float | None = 1.0
+    confidence: Decimal | float | None = Decimal("1.000")
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,7 +422,14 @@ async def settle_card(
             f"account {card_id} is a {card.type!r}, not a credit card"
         )
 
-    paying_account_id = source_account_id or card.billing_account_id
+    # `is not None`, never a truth test: account ids are integers, and `or`
+    # would treat an id of 0 as "no source given" and silently bill the card's
+    # billing account instead of the account the caller named. Falling through
+    # to `_require_account` and being told account 0 does not exist is the
+    # right failure; quietly moving real money out of a different account is not.
+    paying_account_id = (
+        source_account_id if source_account_id is not None else card.billing_account_id
+    )
     if paying_account_id is None:
         raise CardHasNoBillingAccountError(
             f"card {card_id} has no billing account and no source was given"
@@ -455,6 +471,13 @@ async def list_legs(
     wants to name a transfer's two accounts should ask the legs, not re-apply
     the rule that chose them — otherwise the display and the ledger are two
     implementations of the same decision, free to disagree.
+
+    Source first, destination second — money order, the direction a transfer is
+    read and rendered in ("Savings → Visa"). Ordering by `leg_role` itself
+    sorted the words rather than the movement, so 'destination' came back first
+    and a caller that indexed `legs[0]` for the payer got the payee. Today's
+    callers all key by role and could not see it; the ordering is stated here
+    so the next one cannot be caught by it.
     """
     return list(
         await session.scalars(
@@ -463,7 +486,10 @@ async def list_legs(
                 EntryLeg.entry_id == entry_id,
                 EntryLeg.household_id == household_id,
             )
-            .order_by(EntryLeg.leg_role, EntryLeg.id)
+            .order_by(
+                case({"source": 0, "destination": 1}, value=EntryLeg.leg_role, else_=2),
+                EntryLeg.id,
+            )
         )
     )
 
@@ -572,6 +598,7 @@ async def list_entries(
     kinds: Sequence[str] | None = None,
     account_id: int | None = None,
     include_voided: bool = False,
+    order_by: OrderBy = "occurred_at",
     newest_first: bool = False,
     limit: int | None = None,
     offset: int | None = None,
@@ -584,10 +611,34 @@ async def list_entries(
     `newest_first` reverses the ordering, which is the only way to ask for the
     most recent N: with the default ascending order, `limit=5` returns the five
     OLDEST entries in range, and "show me what I just logged" cannot be
-    expressed at all. `id` breaks ties in the same direction as `occurred_at`,
-    so two entries sharing a timestamp — everything dated `@yesterday` lands on
-    Manila midnight — come back in the order they were written rather than
-    arbitrarily.
+    expressed at all. `id` breaks ties in the same direction as the sort
+    column, so two entries sharing a timestamp — everything dated `@yesterday`
+    lands on Manila midnight — come back in the order they were written rather
+    than arbitrarily.
+
+    `order_by` chooses WHICH clock is sorted on, and the two answer different
+    questions:
+
+    * `occurred_at`, the default, is ledger order — when the money moved. Every
+      summary, statement and period view wants this, so it does not change.
+    * `created_at` is when the entry was LOGGED. This is the ordering
+      `core.accounts` documents for the MRU keyboard, for the same reason:
+      backfilling last month's receipt must not reorder what you did most
+      recently. It is also the ONLY ordering under which a backdated entry is
+      reachable — "undo the thing I just typed" and "the last ten things I
+      typed" are questions about the typing, and under `occurred_at` a
+      backdated entry sinks below newer money and can fall off a short list
+      entirely, leaving no way to find its id and so no way to correct it.
+
+    `id` matters more than usual under `created_at`: it defaults to `now()`,
+    which in Postgres is transaction start time, so every entry written in one
+    transaction shares a `created_at` to the microsecond. The tiebreak is what
+    makes "the one I logged last" mean the row actually written last.
+
+    `start_utc`/`end_utc` filter on `occurred_at` whichever ordering is asked
+    for. A period is a question about when the money moved, never about when it
+    was typed; a January expense logged in March belongs to January in every
+    total, and sorting it by the typing must not move it.
     """
     stmt = select(Entry).where(Entry.household_id == household_id)
     stmt = _live(stmt, include_voided)
@@ -608,10 +659,11 @@ async def list_entries(
             )
         )
 
+    column = Entry.created_at if order_by == "created_at" else Entry.occurred_at
     if newest_first:
-        stmt = stmt.order_by(Entry.occurred_at.desc(), Entry.id.desc())
+        stmt = stmt.order_by(column.desc(), Entry.id.desc())
     else:
-        stmt = stmt.order_by(Entry.occurred_at, Entry.id)
+        stmt = stmt.order_by(column, Entry.id)
     if limit is not None:
         stmt = stmt.limit(limit)
     if offset is not None:

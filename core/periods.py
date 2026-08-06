@@ -125,7 +125,7 @@ def resolve(
         raise PeriodError(f"unknown period kind: {kind!r}") from None
 
 
-def manila_today(now: datetime) -> date:
+def manila_today(now: datetime, *, tz: ZoneInfo = MANILA) -> date:
     """The current date in Manila, given an aware instant.
 
     The parser needs a Manila-local `today` for @yesterday; this is the only
@@ -134,7 +134,7 @@ def manila_today(now: datetime) -> date:
     """
     if now.tzinfo is None:
         raise PeriodError("naive datetime — every instant must carry a timezone")
-    return now.astimezone(MANILA).date()
+    return now.astimezone(tz).date()
 
 
 def to_utc(day: date, *, tz: ZoneInfo = MANILA) -> datetime:
@@ -144,3 +144,39 @@ def to_utc(day: date, *, tz: ZoneInfo = MANILA) -> datetime:
     2026-07-28 in Manila is 2026-07-27T16:00Z.
     """
     return _manila_midnight_utc(day, tz)
+
+
+def occurred_at_utc(
+    day: date | None, now: datetime, *, tz: ZoneInfo = MANILA
+) -> datetime:
+    """When the money moved, as a UTC instant.
+
+    The rule every adapter needs and none of them may own: a parsed `@date` —
+    or the absence of one — plus the current instant in, an `occurred_at` out.
+
+    No date, or TODAY's date, means `now`. The user is logging something that
+    just happened, and midnight is between eight and twenty-four hours in the
+    past: an entry typed at 22:00 would be filed at 00:00 that morning, and
+    nothing on screen would say so, because a date line is only shown for an
+    entry that is not for today.
+
+    Any other date lands on local midnight of that day. The user named a DAY,
+    not a second, and midnight is the only instant that does not invent a time
+    they did not give. It is also stable — the same `@2026-08-01` always
+    resolves to the same instant, so period boundaries cannot wobble.
+
+    `@today` and an explicit `@<today's date>` are indistinguishable once
+    `core.parser` is done with them, and are deliberately treated alike. Both
+    stay inside the same Manila day, so no total moves either way.
+
+    "Today" is a Manila question. Comparing UTC dates would call anything
+    logged after 08:00 Manila "not today" for the last eight hours of every
+    day. `manila_today` answers it, and rejects a naive `now` on the way — it
+    is resolved even in the undated case, which needs no comparison, so that a
+    naive `now` can never be returned as an `occurred_at` and stored in a
+    TIMESTAMPTZ column as if it were UTC.
+    """
+    today = manila_today(now, tz=tz)
+    if day is None or day == today:
+        return now
+    return to_utc(day, tz=tz)

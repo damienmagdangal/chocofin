@@ -2,7 +2,9 @@
 
 Every function here takes a session, an `Actor` and plain arguments, and
 returns a `Reply`: text, an optional keyboard as data, and an optional toast.
-`handlers.py` does the translation to and from PTB objects.
+`handlers.py` translates an update into those arguments, and `bot.auth` puts
+the `Reply` on screen — after the transaction has committed, never during it.
+Nothing in this module sends anything.
 
 The split is not decoration. It means the whole behaviour of the bot — the
 parse, the pending row, the claim, the ledger write, every rejection — is
@@ -18,12 +20,11 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Sequence
-from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot import callbacks, keyboards
-from bot.auth import Actor
+from bot.auth import Actor, Reply
 from bot.formatting import (
     INTENT_LABELS,
     KIND_LABELS,
@@ -34,11 +35,9 @@ from bot.formatting import (
     format_minor,
     to_manila,
 )
-from bot.keyboards import Keyboard
 from core import accounts as core_accounts
 from core import balances, ledger, pending
 from core.errors import (
-    AccountNotFoundError,
     CardHasNoBillingAccountError,
     EntryAlreadyVoidedError,
     EntryNotFoundError,
@@ -47,26 +46,13 @@ from core.errors import (
     SameAccountTransferError,
 )
 from core.models import Entry
-from core.parser import ParsedEntry, ParseError, parse
-from core.periods import manila_today, to_utc
+from core.parser import ParseError, parse
+from core.periods import manila_today, occurred_at_utc
 
-# --- replies ----------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class Reply:
-    """What the adapter should put on screen.
-
-    `edit` asks for the originating message to be rewritten rather than
-    answered with a new one — a keyboard that has been used should stop
-    looking like a keyboard.
-    """
-
-    text: str
-    keyboard: Keyboard | None = None
-    toast: str | None = None
-    edit: bool = False
-
+# `Reply` is defined in `bot.auth`, beside the decorator that renders it, and
+# re-exported here because this is where every one of them is built. It cannot
+# live in this module: `bot.auth` would have to import it back, and this module
+# already imports `Actor` from there.
 
 # --- copy -------------------------------------------------------------------
 
@@ -95,6 +81,9 @@ HELP = (
 ALREADY_DONE = "Already recorded."
 EXPIRED = "That one expired. Send it again."
 GONE = "That's no longer waiting for an answer."
+# Not `GONE`: that one is about the pending row, which here is perfectly fine.
+# It is the account under the button that went.
+ACCOUNT_GONE = "That account isn't there any more. Send it again."
 CANCELLED = "Cancelled. Nothing was recorded."
 NO_ACCOUNTS = (
     "This household has no active accounts yet, so there is nowhere to put "
@@ -105,23 +94,10 @@ PAY_USAGE = "How much? Try <code>/pay 3000</code>."
 NOTHING_TO_VOID = "There's nothing to void."
 BAD_ENTRY_ID = "That doesn't look like an entry id. Try <code>/void 412</code>."
 NO_CARDS = "There are no credit cards in this household to settle."
+CLOSED_SECTION = "Closed, still counted:"
 
 
 # --- shared helpers ---------------------------------------------------------
-
-
-def _occurred_at(parsed: ParsedEntry, now: dt.datetime) -> dt.datetime:
-    """When the money moved, as a UTC instant.
-
-    An undated message happened just now. A dated one lands on Manila midnight
-    of that day: the user said which DAY, not which second, and midnight is the
-    only instant that does not invent a time they did not give. It is also
-    stable — the same `@2026-08-01` always resolves to the same instant, so
-    period boundaries cannot wobble.
-    """
-    if parsed.occurred_on is None:
-        return now
-    return to_utc(parsed.occurred_on)
 
 
 def _strip_command(raw: str) -> str:
@@ -223,7 +199,7 @@ async def start_entry(
     if isinstance(parsed, ParseError):
         return Reply(text=esc(parsed.message))
 
-    occurred_at = _occurred_at(parsed, now)
+    occurred_at = occurred_at_utc(parsed.occurred_on, now)
     row = await pending.create(
         session,
         household_id=actor.household_id,
@@ -267,7 +243,7 @@ async def start_transfer(
     if isinstance(parsed, ParseError):
         return Reply(text=esc(parsed.message))
 
-    occurred_at = _occurred_at(parsed, now)
+    occurred_at = occurred_at_utc(parsed.occurred_on, now)
     row = await pending.create(
         session,
         household_id=actor.household_id,
@@ -318,7 +294,7 @@ async def start_settlement(
     if isinstance(parsed, ParseError):
         return Reply(text=esc(parsed.message))
 
-    occurred_at = _occurred_at(parsed, now)
+    occurred_at = occurred_at_utc(parsed.occurred_on, now)
     row = await pending.create(
         session,
         household_id=actor.household_id,
@@ -377,10 +353,15 @@ async def commit_account_choice(
     `claim` and the ledger write run in the transaction the auth decorator
     opened, so the pending row cannot disappear without an entry appearing and
     an entry cannot appear twice. A second tap finds nothing to claim and says
-    so, which is also the answer for a button found in old scrollback.
+    so, which is also the answer for a button found in old scrollback — and for
+    a housemate tapping a keyboard that is not theirs, since `claim` is scoped
+    to the member who typed the message.
     """
     claimed = await pending.claim(
-        session, household_id=actor.household_id, pending_id=pending_id
+        session,
+        household_id=actor.household_id,
+        member_id=actor.member_id,
+        pending_id=pending_id,
     )
     if claimed is None:
         return Reply(text=ALREADY_DONE, toast=ALREADY_DONE)
@@ -401,7 +382,11 @@ async def commit_account_choice(
         entry = await write(
             session,
             household_id=actor.household_id,
-            member_id=actor.member_id,
+            # The typist, read back from the row — not the tapper. `claim` is
+            # member-scoped so these are the same person; this is the line that
+            # says which one is meant. An entry belongs to whoever typed the
+            # message, and their recent-accounts shortlist learns from it.
+            member_id=claimed.member_id,
             account_id=account_id,
             amount_minor=claimed.parsed_amount_minor,
             occurred_at=claimed.occurred_at,
@@ -441,24 +426,38 @@ async def pick_transfer_source(
     keeps the credit-card filter instead of quietly widening to every account.
     """
     row = await pending.get(
-        session, household_id=actor.household_id, pending_id=pending_id
+        session,
+        household_id=actor.household_id,
+        member_id=actor.member_id,
+        pending_id=pending_id,
     )
     if row is None:
         return Reply(text=GONE, toast=GONE, edit=True)
     if now >= row.expires_at:
         return Reply(text=EXPIRED, toast=EXPIRED, edit=True)
+    if row.intent not in ("transfer", "settlement"):
+        # An expense or an income reached a source button. `start_entry` builds
+        # `pick_account`, never `pick_source`, so this is a hand-made payload —
+        # refuse, exactly as the single-leg path refuses a transfer. Carrying on
+        # would file what the user typed as an expense under `kind='transfer'`,
+        # which every spending total filters out.
+        return Reply(text=GONE, toast=GONE, edit=True)
 
     source = await core_accounts.get_account(
         session, household_id=actor.household_id, account_id=account_id
     )
     if source is None:
-        raise AccountNotFoundError(
-            f"account {account_id} is not in household {actor.household_id}"
-        )
+        # `get_account` returns None on purpose rather than raising: an account
+        # can go between the keyboard being drawn and the button being tapped,
+        # and core says in as many words that this is a message to render, not
+        # an exception. Raising it back sent the user the generic "Something
+        # went wrong" and logged a traceback for something that is not a fault.
+        return Reply(text=ACCOUNT_GONE, toast=ACCOUNT_GONE, edit=True)
 
     stored = await pending.set_source_account(
         session,
         household_id=actor.household_id,
+        member_id=actor.member_id,
         pending_id=pending_id,
         account_id=account_id,
     )
@@ -515,19 +514,31 @@ async def commit_destination(
     not an identity guessed from an absence.
     """
     claimed = await pending.claim(
-        session, household_id=actor.household_id, pending_id=pending_id
+        session,
+        household_id=actor.household_id,
+        member_id=actor.member_id,
+        pending_id=pending_id,
     )
     if claimed is None:
         return Reply(text=ALREADY_DONE, toast=ALREADY_DONE)
     if claimed.is_expired(now):
         return Reply(text=EXPIRED, toast=EXPIRED, edit=True)
+    if claimed.intent not in ("transfer", "settlement"):
+        # The mirror of the guard in `commit_account_choice`: a single-leg row
+        # reached a two-leg button. Kept separate from the `source_account_id`
+        # check below, which answers a different question — that one is a
+        # transfer whose first half was never chosen, this one is not a transfer
+        # at all. Neither can be guessed at, so neither is.
+        return Reply(text=GONE, toast=GONE, edit=True)
 
     try:
         if claimed.intent == "settlement":
             entry = await ledger.settle_card(
                 session,
                 household_id=actor.household_id,
-                member_id=actor.member_id,
+                # The typist, as in `commit_account_choice` — a settlement is
+                # two taps, and the second one is not a change of author.
+                member_id=claimed.member_id,
                 card_id=account_id,
                 amount_minor=claimed.parsed_amount_minor,
                 occurred_at=claimed.occurred_at,
@@ -551,7 +562,7 @@ async def commit_destination(
             entry = await ledger.create_transfer(
                 session,
                 household_id=actor.household_id,
-                member_id=actor.member_id,
+                member_id=claimed.member_id,
                 source_account_id=claimed.source_account_id,
                 destination_account_id=account_id,
                 amount_minor=claimed.parsed_amount_minor,
@@ -624,7 +635,9 @@ async def _reopen_for_payer(
     row = await pending.create(
         session,
         household_id=actor.household_id,
-        member_id=actor.member_id,
+        # The replacement row stays the typist's, so the second question is
+        # asked of the person who asked the first one.
+        member_id=claimed.member_id,
         raw_input=claimed.raw_input,
         intent="settlement",
         parsed_kind="transfer",
@@ -672,7 +685,10 @@ async def show_all_accounts(
     the two taps the user is — a stored answer, not an inferred identity.
     """
     row = await pending.get(
-        session, household_id=actor.household_id, pending_id=pending_id
+        session,
+        household_id=actor.household_id,
+        member_id=actor.member_id,
+        pending_id=pending_id,
     )
     if row is None:
         return Reply(text=GONE, toast=GONE, edit=True)
@@ -729,7 +745,10 @@ async def cancel_pending(
 ) -> Reply:
     """[Cancel]: drop the pending row. Nothing was ever written."""
     removed = await pending.cancel(
-        session, household_id=actor.household_id, pending_id=pending_id
+        session,
+        household_id=actor.household_id,
+        member_id=actor.member_id,
+        pending_id=pending_id,
     )
     text = CANCELLED if removed else ALREADY_DONE
     return Reply(text=text, toast=text, edit=True)
@@ -738,11 +757,16 @@ async def cancel_pending(
 # --- reading ----------------------------------------------------------------
 
 
-def _balance_line(balance: balances.AccountBalance) -> str:
+def _balance_line(balance: balances.AccountBalance, *, closed: bool = False) -> str:
     line = (
         f"{esc(account_label(balance.name, balance.type))}  "
         f"<b>{format_minor(balance.balance_minor)}</b>"
     )
+    if closed:
+        # No available-credit line: remaining credit on a card you have shut is
+        # not a number to act on. What this line is here to say is that the
+        # balance above still counts.
+        return line + "\n<i>  closed</i>"
     available = balance.available_credit_minor
     if available is not None:
         line += f"\n<i>  {format_minor(available)} available</i>"
@@ -752,24 +776,68 @@ def _balance_line(balance: balances.AccountBalance) -> str:
 
 
 async def show_balances(session: AsyncSession, actor: Actor) -> Reply:
-    """Every active account, and net worth.
+    """Every account that bears on net worth, and net worth.
 
-    `exclude_from_totals` accounts still show their own balance — the flag
-    keeps them out of the total, not out of sight.
+    The screen has to add up. Every line on it either counts toward the total
+    printed underneath or says on its face that it does not — "not in net
+    worth" for an excluded account, "closed" for a deactivated one.
+
+    That second group is why this reads the accounts twice. `net_worth_minor`
+    counts deactivated accounts on purpose and must keep doing so: closing an
+    account moves no money, and a shut card still owing PHP 3,000.00 is
+    PHP 3,000.00 the household still owes. Listing only the active accounts
+    left that debt off the screen while the total kept it, so the lines came to
+    PHP 3,000.00 more than the figure beneath them with nothing explaining the
+    gap. The reconciliation belongs here, in the rendering — never in
+    `net_worth_minor`.
+
+    A closed account is listed only when it is actually holding the two numbers
+    apart: excluded from totals, or sitting at zero, it contributes nothing to
+    the total and so has no gap to explain.
     """
-    rows = await balances.account_balances(session, household_id=actor.household_id)
-    if not rows:
+    active = await balances.account_balances(session, household_id=actor.household_id)
+    every = await balances.account_balances(
+        session, household_id=actor.household_id, include_inactive=True
+    )
+    active_ids = {row.account_id for row in active}
+    closed = [
+        row
+        for row in every
+        if row.account_id not in active_ids
+        and not row.exclude_from_totals
+        and row.balance_minor != 0
+    ]
+    if not active and not closed:
         return Reply(text=NO_ACCOUNTS)
 
     net = await balances.net_worth_minor(session, household_id=actor.household_id)
-    body = "\n".join(_balance_line(row) for row in rows)
-    return Reply(text=f"{body}\n\n<b>Net worth {format_minor(net)}</b>")
+    sections = ["\n".join(_balance_line(row) for row in active)] if active else []
+    if closed:
+        sections.append(
+            f"<i>{CLOSED_SECTION}</i>\n"
+            + "\n".join(_balance_line(row, closed=True) for row in closed)
+        )
+    sections.append(f"<b>Net worth {format_minor(net)}</b>")
+    return Reply(text="\n\n".join(sections))
 
 
 async def show_last(session: AsyncSession, actor: Actor, *, limit: int = 10) -> Reply:
-    """The most recent entries, newest first."""
+    """The entries most recently LOGGED, newest first.
+
+    Ordered by `created_at`, not `occurred_at`. This is "what have I just
+    typed", and a backdated entry is exactly the one you most need to see here
+    — under ledger order it sinks below newer money and drops off a
+    ten-line list entirely, taking the only copy of its id with it.
+
+    Each line still prints its own `occurred_at`, so a backdated entry says so
+    rather than looking mis-sorted.
+    """
     entries = await ledger.list_entries(
-        session, household_id=actor.household_id, newest_first=True, limit=limit
+        session,
+        household_id=actor.household_id,
+        order_by="created_at",
+        newest_first=True,
+        limit=limit,
     )
     if not entries:
         return Reply(text="Nothing recorded yet.")
@@ -796,6 +864,12 @@ async def start_void(
 
     Voiding does not delete anything; the entry stays readable forever. It does
     change every total that entry was part of, which is why it asks first.
+
+    With no id, the target is the entry most recently LOGGED — ordered by
+    `created_at`, not `occurred_at`. Bare `/void` follows a typo you just
+    noticed, and the entry you just typed is the one you mean even when it was
+    dated into last month. Ledger order would offer some newer, correct entry
+    instead and void the wrong money.
     """
     if argument:
         if not argument.isdigit():
@@ -808,7 +882,11 @@ async def start_void(
             return Reply(text=esc(str(exc)))
     else:
         recent = await ledger.list_entries(
-            session, household_id=actor.household_id, newest_first=True, limit=1
+            session,
+            household_id=actor.household_id,
+            order_by="created_at",
+            newest_first=True,
+            limit=1,
         )
         if not recent:
             return Reply(text=NOTHING_TO_VOID)

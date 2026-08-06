@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as dt
 import html
 
+from core.errors import PeriodError
 from core.periods import MANILA
 
 PESO = "₱"
@@ -61,7 +62,18 @@ def format_signed_minor(amount_minor: int) -> str:
 
 
 def to_manila(moment: dt.datetime) -> dt.datetime:
-    """A stored UTC instant as Manila wall-clock time."""
+    """A stored UTC instant as Manila wall-clock time.
+
+    Rejects a naive datetime, exactly as `core.periods.manila_today` does, and
+    for a sharper reason: `astimezone` on a naive value does not fail, it
+    assumes the SYSTEM's local time. On a box that is not set to UTC every
+    displayed date would then be silently wrong, and it would be wrong in the
+    same direction on every entry, so nothing on screen would look odd. Every
+    timestamp in `entries` is TIMESTAMPTZ and comes back aware; one that
+    arrives naive is a bug upstream of here, not a value to render anyway.
+    """
+    if moment.tzinfo is None:
+        raise PeriodError("naive datetime — every instant must carry a timezone")
     return moment.astimezone(MANILA)
 
 

@@ -108,7 +108,12 @@ async def test_get_reads_the_row_without_taking_it(session: AsyncSession):
     row = await _create(session, world)
     await session.commit()
 
-    got = await pending.get(session, household_id=world.household_id, pending_id=row.id)
+    got = await pending.get(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        pending_id=row.id,
+    )
     assert got is not None
     assert got.id == row.id
     # Still there: `get` renders the next keyboard, it does not consume.
@@ -122,9 +127,45 @@ async def test_get_is_scoped_to_the_household(session: AsyncSession):
 
     assert (
         await pending.get(
-            session, household_id=world.outsider_household_id, pending_id=row.id
+            session,
+            household_id=world.outsider_household_id,
+            member_id=world.outsider_member_id,
+            pending_id=row.id,
         )
         is None
+    )
+
+
+async def test_get_is_scoped_to_the_member(session: AsyncSession):
+    """A housemate cannot read the state of a flow they did not start.
+
+    Same household, so `household_id` is not what makes this pass — this is the
+    member predicate on its own. A household is a shared Telegram chat: everyone
+    in it can see everyone else's keyboards, which is exactly why the row has to
+    be scoped tighter than the household that owns the money.
+    """
+    world = await build_world(session)
+    row = await _create(session, world)
+    await session.commit()
+
+    assert (
+        await pending.get(
+            session,
+            household_id=world.household_id,
+            member_id=world.other_member_id,
+            pending_id=row.id,
+        )
+        is None
+    )
+    # ...and it is still there for the member whose row it is.
+    assert (
+        await pending.get(
+            session,
+            household_id=world.household_id,
+            member_id=world.member_id,
+            pending_id=row.id,
+        )
+        is not None
     )
 
 
@@ -145,6 +186,7 @@ async def test_set_source_account_holds_the_first_tap(session: AsyncSession):
         await pending.set_source_account(
             session,
             household_id=world.household_id,
+            member_id=world.member_id,
             pending_id=pending_id,
             account_id=world.cash_id,
         )
@@ -157,7 +199,10 @@ async def test_set_source_account_holds_the_first_tap(session: AsyncSession):
     session.expire_all()
 
     got = await pending.get(
-        session, household_id=world.household_id, pending_id=pending_id
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        pending_id=pending_id,
     )
     assert got is not None
     assert got.source_account_id == world.cash_id
@@ -172,13 +217,19 @@ async def test_set_source_account_reports_a_row_that_is_gone(session: AsyncSessi
     world = await build_world(session)
     row = await _create(session, world, intent="transfer", parsed_kind="transfer")
     await session.commit()
-    await pending.claim(session, household_id=world.household_id, pending_id=row.id)
+    await pending.claim(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        pending_id=row.id,
+    )
     await session.commit()
 
     assert (
         await pending.set_source_account(
             session,
             household_id=world.household_id,
+            member_id=world.member_id,
             pending_id=row.id,
             account_id=world.cash_id,
         )
@@ -197,6 +248,7 @@ async def test_set_source_account_cannot_reach_another_household(
         await pending.set_source_account(
             session,
             household_id=world.outsider_household_id,
+            member_id=world.outsider_member_id,
             pending_id=row.id,
             account_id=world.outsider_account_id,
         )
@@ -205,6 +257,75 @@ async def test_set_source_account_cannot_reach_another_household(
     await session.commit()
 
     # ...and the row itself is untouched.
+    stored = await session.scalar(
+        select(PendingEntry.source_account_id).where(PendingEntry.id == row.id)
+    )
+    assert stored is None
+
+
+async def test_set_source_account_cannot_reach_another_members_row(
+    session: AsyncSession,
+):
+    """A housemate cannot steer the first half of someone else's transfer.
+
+    Same household — the money is jointly theirs, so nothing above this level
+    would object. A transfer is two taps with a gap in between, and without the
+    member predicate whoever taps first decides where the other person's money
+    leaves from.
+    """
+    world = await build_world(session)
+    row = await _create(session, world, intent="transfer", parsed_kind="transfer")
+    await session.commit()
+
+    assert (
+        await pending.set_source_account(
+            session,
+            household_id=world.household_id,
+            member_id=world.other_member_id,
+            pending_id=row.id,
+            account_id=world.cash_id,
+        )
+        is False
+    )
+    await session.commit()
+
+    # The load-bearing assertion, as in the single-leg case above: nothing
+    # reached the database. A False with the UPDATE still applied would be the
+    # same bug wearing a different answer.
+    stored = await session.scalar(
+        select(PendingEntry.source_account_id).where(PendingEntry.id == row.id)
+    )
+    assert stored is None
+
+
+async def test_set_source_account_refuses_a_single_leg_row(session: AsyncSession):
+    """An expense has no source to remember, and lending it one is the whole bug.
+
+    A source on an expense row is indistinguishable from a half-finished
+    transfer, so the destination tap after it commits as `kind='transfer'` —
+    money the user typed as spending, gone from every spending total. The bot
+    refuses that payload one layer up; core refusing it too is what stops a
+    future caller from reopening the hole.
+    """
+    world = await build_world(session)
+    row = await _create(session, world, intent="expense", parsed_kind="expense")
+    await session.commit()
+
+    assert (
+        await pending.set_source_account(
+            session,
+            household_id=world.household_id,
+            member_id=world.member_id,
+            pending_id=row.id,
+            account_id=world.cash_id,
+        )
+        is False
+    )
+    await session.commit()
+
+    # The load-bearing assertion: nothing reached the database. A returned
+    # False with the UPDATE still applied would be the same bug wearing a
+    # different answer.
     stored = await session.scalar(
         select(PendingEntry.source_account_id).where(PendingEntry.id == row.id)
     )
@@ -228,7 +349,10 @@ async def test_claim_returns_a_snapshot_and_deletes_the_row(session: AsyncSessio
     await session.commit()
 
     claimed = await pending.claim(
-        session, household_id=world.household_id, pending_id=row.id
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        pending_id=row.id,
     )
     await session.commit()
 
@@ -254,11 +378,17 @@ async def test_a_second_claim_finds_nothing(session: AsyncSession):
     await session.commit()
 
     first = await pending.claim(
-        session, household_id=world.household_id, pending_id=row.id
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        pending_id=row.id,
     )
     await session.commit()
     second = await pending.claim(
-        session, household_id=world.household_id, pending_id=row.id
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        pending_id=row.id,
     )
     await session.commit()
 
@@ -283,7 +413,10 @@ async def test_two_concurrent_claims_leave_one_winner(
     async def tap() -> pending.ClaimedPending | None:
         async with AsyncSession(engine, expire_on_commit=False) as s:
             claimed = await pending.claim(
-                s, household_id=world.household_id, pending_id=row.id
+                s,
+                household_id=world.household_id,
+                member_id=world.member_id,
+                pending_id=row.id,
             )
             await s.commit()
             return claimed
@@ -309,7 +442,10 @@ async def test_an_expired_row_is_still_claimed_and_deleted(session: AsyncSession
     await session.commit()
 
     claimed = await pending.claim(
-        session, household_id=world.household_id, pending_id=row.id
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        pending_id=row.id,
     )
     await session.commit()
 
@@ -333,13 +469,19 @@ async def test_a_member_cannot_claim_another_households_row(session: AsyncSessio
 
     assert (
         await pending.claim(
-            session, household_id=world.household_id, pending_id=theirs.id
+            session,
+            household_id=world.household_id,
+            member_id=world.member_id,
+            pending_id=theirs.id,
         )
         is None
     )
     assert (
         await pending.cancel(
-            session, household_id=world.household_id, pending_id=theirs.id
+            session,
+            household_id=world.household_id,
+            member_id=world.member_id,
+            pending_id=theirs.id,
         )
         is False
     )
@@ -350,10 +492,63 @@ async def test_a_member_cannot_claim_another_households_row(session: AsyncSessio
         await pending.get(
             session,
             household_id=world.outsider_household_id,
+            member_id=world.outsider_member_id,
             pending_id=theirs.id,
         )
         is not None
     )
+
+
+async def test_a_housemate_cannot_claim_your_pending_row(session: AsyncSession):
+    """The bug this scoping exists for, at the level it has to be fixed.
+
+    Member A types the message; member B taps the button in the same shared
+    chat. `household_id` matches — they really are in the same household — so it
+    is the member predicate or nothing. Without it the entry is written against
+    B, who never typed it, and B's recent-accounts shortlist learns from money
+    they did not spend.
+
+    `cancel` is checked alongside because it is `claim` underneath: if it took a
+    different route to the row, B could still make A's keyboard vanish.
+    """
+    world = await build_world(session)
+    row = await _create(session, world)
+    await session.commit()
+    pending_id = row.id
+
+    assert (
+        await pending.claim(
+            session,
+            household_id=world.household_id,
+            member_id=world.other_member_id,
+            pending_id=pending_id,
+        )
+        is None
+    )
+    assert (
+        await pending.cancel(
+            session,
+            household_id=world.household_id,
+            member_id=world.other_member_id,
+            pending_id=pending_id,
+        )
+        is False
+    )
+    await session.commit()
+
+    # Still there, and still answerable by the member who typed it. A guard that
+    # refused everyone would pass the two assertions above and break the bot.
+    claimed = await pending.claim(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        pending_id=pending_id,
+    )
+    await session.commit()
+
+    assert claimed is not None
+    assert claimed.member_id == world.member_id
+    assert await _count(session) == 0
 
 
 # --- cancel -----------------------------------------------------------------
@@ -366,14 +561,20 @@ async def test_cancel_removes_the_row_once(session: AsyncSession):
 
     assert (
         await pending.cancel(
-            session, household_id=world.household_id, pending_id=row.id
+            session,
+            household_id=world.household_id,
+            member_id=world.member_id,
+            pending_id=row.id,
         )
         is True
     )
     await session.commit()
     assert (
         await pending.cancel(
-            session, household_id=world.household_id, pending_id=row.id
+            session,
+            household_id=world.household_id,
+            member_id=world.member_id,
+            pending_id=row.id,
         )
         is False
     )
@@ -418,15 +619,32 @@ async def test_the_sweep_only_clears_this_members_expired_rows(session: AsyncSes
     await _create(session, world, now=NOW)
     await session.commit()
 
-    async def alive(pending_id: int, household_id: int) -> bool:
+    # `get` is member-scoped, so each row has to be looked for as its own owner.
+    # Asking as the sweeping member would return None for everyone else's rows
+    # and this test would report them all collected.
+    async def alive(pending_id: int, household_id: int, member_id: int) -> bool:
         return (
-            await pending.get(session, household_id=household_id, pending_id=pending_id)
+            await pending.get(
+                session,
+                household_id=household_id,
+                member_id=member_id,
+                pending_id=pending_id,
+            )
         ) is not None
 
-    assert await alive(mine_dead.id, world.household_id) is False
-    assert await alive(mine_live.id, world.household_id) is True
+    assert await alive(mine_dead.id, world.household_id, world.member_id) is False
+    assert await alive(mine_live.id, world.household_id, world.member_id) is True
     # Another member's dead row is still dead, but it is not this call's to
     # collect — and their live keyboard is certainly not.
-    assert await alive(theirs_dead.id, world.household_id) is True
-    assert await alive(theirs_live.id, world.household_id) is True
-    assert await alive(outsider_dead.id, world.outsider_household_id) is True
+    assert (
+        await alive(theirs_dead.id, world.household_id, world.other_member_id) is True
+    )
+    assert (
+        await alive(theirs_live.id, world.household_id, world.other_member_id) is True
+    )
+    assert (
+        await alive(
+            outsider_dead.id, world.outsider_household_id, world.outsider_member_id
+        )
+        is True
+    )

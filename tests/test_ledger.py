@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import func, select
@@ -539,6 +540,24 @@ async def test_plain_string_tags_are_manual(session: AsyncSession):
     assert float(confidence) == 1.0
 
 
+async def test_the_default_confidence_is_a_decimal_not_a_float():
+    """`TagSpec` documents that a confidence never routes through float.
+
+    Needs no database — it is `async` only because this module marks every test
+    `asyncio`, and a sync test under that mark warns.
+
+    The default was the one value that did. It reaches a Numeric(4,3) column,
+    so nothing has gone wrong yet — but a class whose docstring promises
+    Decimals and hands out a float has one of the two wrong, and the cheap one
+    to fix is the value.
+    """
+    spec = ledger.TagSpec("bonus")
+    assert isinstance(spec.confidence, Decimal)
+    assert spec.confidence == Decimal("1.000")
+    # A caller's own number is still taken as given, float or not.
+    assert ledger.TagSpec("lunch", origin="ai", confidence=0.62).confidence == 0.62
+
+
 async def test_transfer_tags_survive_a_commit(session: AsyncSession):
     """A transfer holds tags on exactly the same terms as an expense.
 
@@ -785,6 +804,32 @@ async def test_explicit_source_beats_the_billing_account(session: AsyncSession):
     assert savings.balance_minor == 0  # the billing account was not touched
 
 
+async def test_settle_card_does_not_read_account_zero_as_no_source(
+    session: AsyncSession,
+):
+    """An id is a number, so "was a source given?" is not a truth test.
+
+    Under `source_account_id or card.billing_account_id`, an id of 0 is falsey
+    and the card's billing account pays instead — a settlement out of an
+    account the caller never named, recorded as if it had been asked for. It
+    has to reach the account lookup and be refused there.
+    """
+    world = await build_world(session)
+    with pytest.raises(AccountNotFoundError):
+        await ledger.settle_card(
+            session,
+            household_id=world.household_id,
+            member_id=world.member_id,
+            card_id=world.card_id,
+            amount_minor=250_000,
+            occurred_at=JAN_15,
+            source_account_id=0,
+        )
+
+    # Nothing was written, and in particular nothing left the billing account.
+    assert await ledger.list_entries(session, household_id=world.household_id) == []
+
+
 async def test_settlement_never_reaches_a_summary(session: AsyncSession):
     """The purchase is the spending. The settlement is not a second one.
 
@@ -859,10 +904,11 @@ async def test_list_legs_returns_both_sides_of_a_transfer(session: AsyncSession)
         session, household_id=world.household_id, entry_id=transfer.id
     )
     assert len(legs) == 2
-    # Ordered by leg_role, so 'destination' comes before 'source'.
-    assert [leg.leg_role for leg in legs] == ["destination", "source"]
-    assert [leg.account_id for leg in legs] == [world.cash_id, world.savings_id]
-    assert [leg.amount_minor for leg in legs] == [300_000, -300_000]
+    # Money order: where it left, then where it landed. Sorting on the role text
+    # instead would put 'destination' first and hand `legs[0]` the payee.
+    assert [leg.leg_role for leg in legs] == ["source", "destination"]
+    assert [leg.account_id for leg in legs] == [world.savings_id, world.cash_id]
+    assert [leg.amount_minor for leg in legs] == [-300_000, 300_000]
     assert sum(leg.amount_minor for leg in legs) == 0
 
 
@@ -1081,6 +1127,156 @@ async def test_newest_first_breaks_ties_by_write_order(session: AsyncSession):
         session, household_id=world.household_id, newest_first=True, limit=1
     )
     assert [e.id for e in latest] == [third.id]
+
+
+# --- order_by ---------------------------------------------------------------
+
+
+async def test_order_by_created_at_finds_the_backdated_entry(session: AsyncSession):
+    """The bug behind `/void` offering the wrong entry.
+
+    Log something dated March, then notice a January receipt and backfill it.
+    Under ledger order the March entry is still on top, so bare `/void` offers
+    it — and on a short list the January one is not there at all, taking the
+    only copy of its id with it. `order_by="created_at"` asks the other
+    question: what did I most recently TYPE.
+    """
+    world = await build_world(session)
+    common = {
+        "household_id": world.household_id,
+        "member_id": world.member_id,
+        "account_id": world.cash_id,
+    }
+    march = await ledger.create_expense(
+        session, amount_minor=1_000, occurred_at=MAR_20, **common
+    )
+    backdated = await ledger.create_expense(
+        session, amount_minor=2_000, occurred_at=JAN_15, **common
+    )
+    await session.commit()
+
+    by_occurrence = await ledger.list_entries(
+        session, household_id=world.household_id, newest_first=True, limit=1
+    )
+    assert [e.id for e in by_occurrence] == [march.id]
+
+    by_logging = await ledger.list_entries(
+        session,
+        household_id=world.household_id,
+        order_by="created_at",
+        newest_first=True,
+        limit=1,
+    )
+    assert [e.id for e in by_logging] == [backdated.id]
+
+    # Not just the first row: the whole listing is reversed relative to ledger
+    # order, because the two clocks disagree about every pair here.
+    assert [
+        e.id
+        for e in await ledger.list_entries(
+            session,
+            household_id=world.household_id,
+            order_by="created_at",
+            newest_first=True,
+        )
+    ] == [backdated.id, march.id]
+
+
+async def test_order_by_created_at_ascends_by_default(session: AsyncSession):
+    """The two knobs are independent: one picks the clock, one the direction."""
+    world = await build_world(session)
+    common = {
+        "household_id": world.household_id,
+        "member_id": world.member_id,
+        "account_id": world.cash_id,
+    }
+    first = await ledger.create_expense(
+        session, amount_minor=1_000, occurred_at=MAR_20, **common
+    )
+    second = await ledger.create_expense(
+        session, amount_minor=2_000, occurred_at=JAN_15, **common
+    )
+    await session.commit()
+
+    oldest_logged_first = await ledger.list_entries(
+        session, household_id=world.household_id, order_by="created_at"
+    )
+    assert [e.id for e in oldest_logged_first] == [first.id, second.id]
+
+
+async def test_list_entries_defaults_to_occurred_at_order(session: AsyncSession):
+    """Omitting `order_by` is the old behaviour, exactly.
+
+    Every summary and statement view wants ledger order, so a future flip of
+    this default has to fail here rather than quietly reorder them.
+    """
+    world = await build_world(session)
+    common = {
+        "household_id": world.household_id,
+        "member_id": world.member_id,
+        "account_id": world.cash_id,
+    }
+    await ledger.create_expense(
+        session, amount_minor=1_000, occurred_at=MAR_20, **common
+    )
+    await ledger.create_expense(
+        session, amount_minor=2_000, occurred_at=JAN_15, **common
+    )
+    await session.commit()
+
+    for newest_first in (False, True):
+        implicit = await ledger.list_entries(
+            session, household_id=world.household_id, newest_first=newest_first
+        )
+        explicit = await ledger.list_entries(
+            session,
+            household_id=world.household_id,
+            order_by="occurred_at",
+            newest_first=newest_first,
+        )
+        assert [e.id for e in implicit] == [e.id for e in explicit]
+
+
+async def test_order_by_does_not_change_the_period_filter(session: AsyncSession):
+    """`start_utc`/`end_utc` select on `occurred_at` under either ordering.
+
+    A period is a question about when the money MOVED. A January expense
+    backfilled in March belongs to January in every total; sorting a listing by
+    the typing must not move it into March.
+    """
+    world = await build_world(session)
+    common = {
+        "household_id": world.household_id,
+        "member_id": world.member_id,
+        "account_id": world.cash_id,
+    }
+    backdated = await ledger.create_expense(
+        session, amount_minor=1_000, occurred_at=JAN_15, **common
+    )
+    await session.commit()
+
+    jan_start, jan_end = january()
+    mar_start, mar_end = march()
+
+    in_january = await ledger.list_entries(
+        session,
+        household_id=world.household_id,
+        start_utc=jan_start,
+        end_utc=jan_end,
+        order_by="created_at",
+        newest_first=True,
+    )
+    assert [e.id for e in in_january] == [backdated.id]
+
+    in_march = await ledger.list_entries(
+        session,
+        household_id=world.household_id,
+        start_utc=mar_start,
+        end_utc=mar_end,
+        order_by="created_at",
+        newest_first=True,
+    )
+    assert in_march == []
 
 
 # --- summarise --------------------------------------------------------------

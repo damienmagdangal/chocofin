@@ -10,7 +10,7 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from core.errors import PeriodError
-from core.periods import MANILA, manila_today, resolve, to_utc
+from core.periods import MANILA, manila_today, occurred_at_utc, resolve, to_utc
 
 # Manila is UTC+08:00, so local midnight is 16:00Z on the PREVIOUS day.
 MIDNIGHT_OFFSET = timedelta(hours=16)
@@ -214,3 +214,81 @@ def test_manila_today_is_not_utc_today():
     """The bug this guards: using UTC's date for a Manila user's 'yesterday'."""
     late_evening_manila = utc(2026, 8, 3, 16, 30)
     assert manila_today(late_evening_manila) != late_evening_manila.date()
+
+
+# --- occurred_at_utc --------------------------------------------------------
+
+
+def test_occurred_at_utc_undated_is_now():
+    """No @date at all: the money moved when the message was sent."""
+    now = utc(2026, 8, 6, 14, 0)  # 22:00 Manila
+    assert occurred_at_utc(None, now) is now
+
+
+def test_occurred_at_utc_today_is_now_not_midnight():
+    """The bug: @today used to mean 00:00 Manila, up to 24 hours in the past.
+
+    An entry typed at 22:00 landed at 00:00 that morning, and nothing on screen
+    said so — the date line is suppressed precisely when the Manila dates
+    match, which they did.
+    """
+    now = utc(2026, 8, 6, 14, 0)  # 22:00 Manila on the 6th
+    today = date(2026, 8, 6)
+
+    assert occurred_at_utc(today, now) == now
+    assert occurred_at_utc(today, now) != to_utc(today)
+
+
+def test_occurred_at_utc_backdates_to_manila_midnight():
+    """An explicit past date still lands on Manila midnight, unchanged."""
+    now = utc(2026, 8, 6, 14, 0)
+    assert occurred_at_utc(date(2026, 7, 28), now) == utc(2026, 7, 27, 16, 0)
+
+
+def test_occurred_at_utc_backdating_is_stable_across_the_clock():
+    """The same @date resolves to the same instant whatever time it is typed.
+
+    That stability is why a backdated entry gets midnight rather than `now`:
+    period boundaries cannot wobble with the sender's clock.
+    """
+    day = date(2026, 7, 28)
+    morning = occurred_at_utc(day, utc(2026, 8, 6, 1, 0))
+    evening = occurred_at_utc(day, utc(2026, 8, 6, 14, 0))
+    assert morning == evening == utc(2026, 7, 27, 16, 0)
+
+
+def test_occurred_at_utc_tomorrow_is_midnight():
+    """The special case is TODAY only. A future date is a date, not now."""
+    now = utc(2026, 8, 6, 14, 0)
+    assert occurred_at_utc(date(2026, 8, 7), now) == to_utc(date(2026, 8, 7))
+
+
+def test_occurred_at_utc_today_is_a_manila_question():
+    """Comparing UTC dates would get "today" wrong for 8 hours out of 24.
+
+    Both instants below fall on 2026-08-06 in UTC. Only the first is the 6th in
+    Manila; the second is already the 7th. A UTC comparison would call the
+    second one "today" and file it at `now` when the user's own calendar says
+    it is a different day.
+    """
+    before_midnight = utc(2026, 8, 6, 15, 30)  # 23:30 Manila, still the 6th
+    after_midnight = utc(2026, 8, 6, 16, 30)  # 00:30 Manila, now the 7th
+    assert before_midnight.date() == after_midnight.date()
+
+    sixth = date(2026, 8, 6)
+    assert occurred_at_utc(sixth, before_midnight) == before_midnight
+    assert occurred_at_utc(sixth, after_midnight) == to_utc(sixth)
+
+
+def test_occurred_at_utc_rejects_a_naive_now():
+    """A naive `now` is an unanswerable question, not a UTC assumption.
+
+    Including the undated case, which needs no date comparison at all: a naive
+    `now` returned unchanged would be written straight into a TIMESTAMPTZ
+    column as if it were UTC.
+    """
+    naive = datetime(2026, 8, 6, 22, 0)
+    with pytest.raises(PeriodError):
+        occurred_at_utc(date(2026, 8, 6), naive)
+    with pytest.raises(PeriodError):
+        occurred_at_utc(None, naive)

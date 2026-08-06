@@ -15,6 +15,7 @@ from bot.formatting import (
     format_signed_minor,
     to_manila,
 )
+from core.errors import PeriodError
 
 
 @pytest.mark.parametrize(
@@ -68,6 +69,17 @@ def test_manila_is_utc_plus_eight():
     assert (local.year, local.month, local.day) == (2026, 8, 4)
     assert local.hour == 7
     assert format_date(late) == "4 Aug 2026"
+
+
+@pytest.mark.parametrize("render", [to_manila, format_date, format_datetime])
+def test_a_naive_datetime_is_refused_rather_than_read_as_local_time(render):
+    """`astimezone` does not fail on a naive value — it assumes the box's own
+    timezone. On a server that is not UTC that silently shifts every date on
+    screen, in the same direction every time, so nothing looks wrong.
+    `core.periods.manila_today` already refuses one; this is the display side
+    of the same rule."""
+    with pytest.raises(PeriodError):
+        render(dt.datetime(2026, 8, 4, 6, 15))
 
 
 def test_format_datetime_uses_twelve_hour_manila_time():
