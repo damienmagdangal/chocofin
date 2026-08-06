@@ -28,6 +28,12 @@ async def get_member_by_telegram_id(
     to resolve a name for someone who has since left the household, and a
     lookup that silently pretends they never existed cannot serve that.
     """
-    return await session.scalar(
+    # `scalar_one_or_none`, not `scalar`: `scalar` returns the FIRST row and
+    # discards the rest. `members.telegram_user_id` is globally UNIQUE, so this
+    # can never return two — and that is exactly why the stricter call belongs
+    # here. If the constraint is ever not there, the difference is between
+    # raising and silently picking one of two households for the same person.
+    result = await session.execute(
         select(Member).where(Member.telegram_user_id == telegram_user_id)
     )
+    return result.scalar_one_or_none()

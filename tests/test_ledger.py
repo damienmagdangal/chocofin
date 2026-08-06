@@ -17,6 +17,7 @@ from core.errors import (
     EntryNotFoundError,
     InvalidAmountError,
     NotACreditCardError,
+    PeriodError,
     SameAccountTransferError,
 )
 from core.models import Entry, EntryLeg, EntryTag
@@ -85,6 +86,96 @@ async def test_amounts_must_be_positive_integers(session: AsyncSession):
                 amount_minor=bad,
                 occurred_at=JAN_15,
             )
+
+
+# --- occurred_at must carry a timezone --------------------------------------
+#
+# `occurred_at` is the column every period, every monthly total and every budget
+# window is cut on, and Manila is UTC+08:00. A naive value is up to eight hours
+# adrift from the instant the caller meant: at a day boundary that is the wrong
+# DAY, and at a month boundary the wrong MONTH. Nothing on screen would say so
+# — the entry exists and the amount is right, it is simply absent from the total
+# the user is looking at and present in one they are not.
+#
+# `core.periods.manila_today` has always refused a naive instant on the way IN
+# to a period calculation. These are the write boundaries, where the value is
+# stored rather than computed with, and where a caller that built an
+# `occurred_at` by some other route used to get through unchecked.
+
+# JAN_15 with the timezone taken off. Same wall-clock reading, no anchor.
+NAIVE = dt.datetime(2026, 1, 15, 4, 0)
+
+
+async def _write_expense(session: AsyncSession, world, when: dt.datetime):
+    return await ledger.create_expense(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        account_id=world.cash_id,
+        amount_minor=10_000,
+        occurred_at=when,
+    )
+
+
+async def _write_income(session: AsyncSession, world, when: dt.datetime):
+    return await ledger.create_income(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        account_id=world.cash_id,
+        amount_minor=10_000,
+        occurred_at=when,
+    )
+
+
+async def _write_transfer(session: AsyncSession, world, when: dt.datetime):
+    return await ledger.create_transfer(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        source_account_id=world.savings_id,
+        destination_account_id=world.cash_id,
+        amount_minor=10_000,
+        occurred_at=when,
+    )
+
+
+async def _write_settlement(session: AsyncSession, world, when: dt.datetime):
+    """The fourth way in. It reaches `create_transfer`, and that is the point:
+    the guard is on the shared boundary, not copied into each caller."""
+    return await ledger.settle_card(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        card_id=world.card_id,
+        amount_minor=10_000,
+        occurred_at=when,
+    )
+
+
+@pytest.mark.parametrize(
+    "write",
+    [_write_expense, _write_income, _write_transfer, _write_settlement],
+    ids=["create_expense", "create_income", "create_transfer", "settle_card"],
+)
+async def test_a_naive_occurred_at_is_refused_at_every_write_boundary(
+    session: AsyncSession, write
+):
+    world = await build_world(session)
+
+    with pytest.raises(PeriodError):
+        await write(session, world, NAIVE)
+
+    # Refused BEFORE anything was staged, not rolled back afterwards: a
+    # half-written entry waiting in the session would surface on whatever
+    # unrelated flush came next.
+    assert await session.scalar(select(func.count()).select_from(Entry)) == 0
+
+    # The same call with the timezone on goes through. Without this half, a
+    # function that refused every `occurred_at` would pass the test above.
+    await write(session, world, JAN_15)
+    await session.commit()
+    assert await session.scalar(select(func.count()).select_from(Entry)) == 1
 
 
 # --- leg shape --------------------------------------------------------------
@@ -306,6 +397,56 @@ async def test_voided_entry_leaves_the_summary(session: AsyncSession):
     assert after.expense_minor == 0
 
 
+async def test_a_naive_voided_at_is_refused_and_the_entry_stays_live(
+    session: AsyncSession,
+):
+    """The last datetime in this module that could be stored naive.
+
+    `voided_at` moves no money and cuts no period, so the harm is smaller than a
+    naive `occurred_at` — but it is the record of WHEN a correction was made,
+    and eight hours is enough to reorder a void against the replacement that
+    followed it. The default is `now(UTC)`; only a caller supplying its own can
+    get here, and a caller supplying its own is reconstructing history.
+
+    The entry has to survive the rejection. `void_entry` is the one mutation
+    permitted on `entries`, and a guard that raised after stamping the row would
+    leave the void half-applied for whatever flushed next.
+    """
+    world = await build_world(session)
+    entry = await ledger.create_expense(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        account_id=world.cash_id,
+        amount_minor=10_000,
+        occurred_at=JAN_15,
+    )
+    await session.commit()
+
+    with pytest.raises(PeriodError):
+        await ledger.void_entry(
+            session,
+            household_id=world.household_id,
+            entry_id=entry.id,
+            voided_at=NAIVE,
+        )
+
+    still_live = await session.scalar(select(Entry).where(Entry.id == entry.id))
+    assert still_live.voided_at is None
+
+    # Aware, and it goes through — with the stamp the caller gave, not now().
+    await ledger.void_entry(
+        session,
+        household_id=world.household_id,
+        entry_id=entry.id,
+        voided_at=MAR_20,
+    )
+    await session.commit()
+    assert (
+        await session.scalar(select(Entry.voided_at).where(Entry.id == entry.id))
+    ) == MAR_20
+
+
 # --- reassign_account -------------------------------------------------------
 
 
@@ -465,6 +606,45 @@ async def test_reassign_refuses_transfers(session: AsyncSession):
             entry_id=transfer.id,
             account_id=world.cash_id,
         )
+
+
+async def test_reassign_refuses_a_naive_voided_at_without_half_correcting(
+    session: AsyncSession,
+):
+    """`reassign_account` forwards `voided_at` to `void_entry`, so it inherits
+    the guard rather than repeating it.
+
+    What matters is WHERE in the sequence it fires. A correction is one
+    transaction — void the original, insert the replacement — and the reads that
+    come first (the entry, its tags) write nothing. So the rejection has to
+    leave the original live and unreplaced: one entry in the household, exactly
+    as before the call.
+    """
+    world = await build_world(session)
+    original = await ledger.create_expense(
+        session,
+        household_id=world.household_id,
+        member_id=world.member_id,
+        account_id=world.cash_id,
+        amount_minor=10_000,
+        occurred_at=JAN_15,
+        tags=["lunch"],
+    )
+    await session.commit()
+
+    with pytest.raises(PeriodError):
+        await ledger.reassign_account(
+            session,
+            household_id=world.household_id,
+            entry_id=original.id,
+            account_id=world.savings_id,
+            voided_at=NAIVE,
+        )
+
+    assert await session.scalar(select(func.count()).select_from(Entry)) == 1
+    survivor = await session.scalar(select(Entry).where(Entry.id == original.id))
+    assert survivor.voided_at is None
+    assert survivor.replaces_entry_id is None
 
 
 async def test_reassign_preserves_tag_provenance(session: AsyncSession):
@@ -802,6 +982,37 @@ async def test_explicit_source_beats_the_billing_account(session: AsyncSession):
     )
     assert cash.balance_minor == -250_000
     assert savings.balance_minor == 0  # the billing account was not touched
+
+
+async def test_a_fee_account_of_zero_is_not_read_as_no_fee_account(
+    session: AsyncSession,
+):
+    """The same truth test as below, on the other side of the same file.
+
+    Under `fee_account_id or source_account_id`, an id of 0 is falsey and the
+    fee is quietly charged to the account the transfer left from — real money
+    out of an account the caller did not name for it, on an entry that reads as
+    if it had been asked for. It has to reach the account lookup and be refused.
+    """
+    world = await build_world(session)
+    with pytest.raises(AccountNotFoundError):
+        await ledger.create_transfer(
+            session,
+            household_id=world.household_id,
+            member_id=world.member_id,
+            source_account_id=world.cash_id,
+            destination_account_id=world.savings_id,
+            amount_minor=500_000,
+            occurred_at=JAN_15,
+            fee_minor=1_500,
+            fee_account_id=0,
+        )
+
+    # The transfer itself is rolled back with the fee: both are one call, and a
+    # transfer that moved money while its fee was refused would be a half-written
+    # instruction the user never gets told about.
+    await session.rollback()
+    assert await ledger.list_entries(session, household_id=world.household_id) == []
 
 
 async def test_settle_card_does_not_read_account_zero_as_no_source(

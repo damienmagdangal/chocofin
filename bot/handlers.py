@@ -42,9 +42,17 @@ def _text(update: Update) -> str:
 
 
 def _argument(update: Update) -> str | None:
-    """Whatever followed a /command, as one string."""
-    _, _, rest = _text(update).strip().partition(" ")
-    return rest.strip() or None
+    """Whatever followed a /command, as one string.
+
+    `split(maxsplit=1)` splits on ANY whitespace, which a literal " " does not.
+    A mobile keyboard turns "/void" + newline + "412" into one message often
+    enough to matter, and `partition(" ")` found no space in it, returned no
+    argument, and left `/void` targeting the most recently logged entry — so a
+    user asking to void #412 was shown a different entry to confirm. Same shape
+    as `bot.flows._strip_command`; the two must not drift.
+    """
+    parts = _text(update).strip().split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else None
 
 
 # --- commands ---------------------------------------------------------------

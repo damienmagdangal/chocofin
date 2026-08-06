@@ -151,16 +151,46 @@ async def test_transfer_fee_is_a_separate_expense_not_a_leg(
     )
     await session.commit()
 
-    # The transfer itself is still exactly two legs summing to zero.
-    legs = await session.scalars(
-        select(Entry).where(Entry.related_entry_id == transfer.id)
+    # The transfer itself is still exactly two legs summing to zero. Asserted
+    # here rather than left to the trigger: the trigger refuses a THIRD leg, but
+    # a fee netted into the source leg — 305,000 out, 300,000 in — would break
+    # sum-to-zero, and a fee entry written with the wrong sign or against the
+    # wrong account would satisfy every constraint in the database.
+    transfer_legs = await ledger.list_legs(
+        session, household_id=world.household_id, entry_id=transfer.id
     )
-    fee_entries = list(legs)
-    assert len(fee_entries) == 1
-    fee = fee_entries[0]
+    assert len(transfer_legs) == 2
+    by_role = {leg.leg_role: leg for leg in transfer_legs}
+    assert set(by_role) == {"source", "destination"}
+    assert by_role["source"].account_id == world.savings_id
+    assert by_role["source"].amount_minor == -300_000
+    assert by_role["destination"].account_id == world.cash_id
+    assert by_role["destination"].amount_minor == 300_000
+    assert sum(leg.amount_minor for leg in transfer_legs) == 0
+    # And the fee is nowhere among them, in either direction.
+    assert 5_000 not in {abs(leg.amount_minor) for leg in transfer_legs}
+
+    # It is its own entry instead, pointing back at the transfer.
+    related = list(
+        await session.scalars(
+            select(Entry).where(Entry.related_entry_id == transfer.id)
+        )
+    )
+    assert len(related) == 1
+    fee = related[0]
     assert fee.kind == "expense"
     assert fee.amount_minor == 5_000
     assert fee.related_entry_id == transfer.id
+
+    # One leg, negative, on the account that paid the fee — the shape of an
+    # expense, which is what a fee is.
+    fee_legs = await ledger.list_legs(
+        session, household_id=world.household_id, entry_id=fee.id
+    )
+    (fee_leg,) = fee_legs
+    assert fee_leg.leg_role == "source"
+    assert fee_leg.account_id == world.savings_id
+    assert fee_leg.amount_minor == -5_000
 
     summary = await ledger.summarise(
         session,

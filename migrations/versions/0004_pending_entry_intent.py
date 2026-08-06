@@ -46,6 +46,15 @@ moved money, no `entries` row depends on it, and the worst it costs is retyping
 "120 coffee". The migrations rule that forbids a data migration scopes itself to
 `entries`, which this does not touch.
 
+Both directions LOCK the table first. `ADD COLUMN` takes ACCESS EXCLUSIVE anyway,
+so the lock is not redundant with it — it is redundant only if nothing runs
+BEFORE it, and the DELETE does. The bot is still up while this migrates: a
+`pending.create` landing between the DELETE and the ADD COLUMN repopulates the
+table, and a NOT NULL column with no default cannot be added to a populated one.
+The migration is one transaction so that fails safely, but it fails during a
+deploy for a reason that will not reproduce on the retry. Taking the lock first
+closes the window.
+
 Revision ID: 0004_pending_entry_intent
 Revises: 0003_pending_entry_columns
 Create Date: 2026-08-05
@@ -63,6 +72,10 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    # Before the DELETE, not after it: see the locking note above. Held until
+    # this migration commits, because `env.py` runs every revision inside
+    # `context.begin_transaction()` and Postgres DDL is transactional.
+    op.execute("LOCK TABLE pending_entries IN ACCESS EXCLUSIVE MODE")
     # Unanswered keyboards, cleared so the NOT NULL column can be added without
     # inventing an intent for them. See the note above.
     op.execute("DELETE FROM pending_entries")
@@ -81,6 +94,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Same lock, for a narrower reason: a row inserted between the DELETE and
+    # the DROP COLUMN survives the downgrade, and the next `upgrade` then fails
+    # on exactly the row this revision has just stripped the intent from.
+    op.execute("LOCK TABLE pending_entries IN ACCESS EXCLUSIVE MODE")
     # Same DELETE, for the same reason in the other direction: every row here
     # was written knowing which question it was asking, the older schema cannot
     # hold that, and leaving the rows would make the next `upgrade` fail on

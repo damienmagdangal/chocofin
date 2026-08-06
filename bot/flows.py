@@ -45,7 +45,7 @@ from core.errors import (
     NotACreditCardError,
     SameAccountTransferError,
 )
-from core.models import Entry
+from core.models import Account, Entry
 from core.parser import ParseError, parse
 from core.periods import manila_today, occurred_at_utc
 
@@ -109,10 +109,19 @@ def _strip_command(raw: str) -> str:
     removed and the remainder goes through the parser as ordinary text. Every
     amount rejection still comes from the one parser, rather than a second
     implementation growing here.
+
+    Split on ANY whitespace, not on a literal " ". A mobile keyboard produces
+    "/transfer" + newline + "500" routinely, and `partition(" ")` found no space
+    in it: the whole message stayed as the head, nothing was stripped, and the
+    parser was handed the word "transfer", which it refuses outright. The user
+    saw an amount rejection for a message that named a perfectly good amount.
+    Same shape as `bot.handlers._argument`; the two must not drift.
     """
-    head, _, rest = raw.strip().partition(" ")
-    if head.startswith("/"):
-        return rest.strip()
+    parts = raw.strip().split(maxsplit=1)
+    if not parts:
+        return ""
+    if parts[0].startswith("/"):
+        return parts[1].strip() if len(parts) > 1 else ""
     return raw.strip()
 
 
@@ -143,6 +152,29 @@ def _dated(occurred_at: dt.datetime, now: dt.datetime) -> str:
     return f"\n<i>{format_date(occurred_at)}</i>"
 
 
+async def _offerable(
+    session: AsyncSession,
+    actor: Actor,
+    *,
+    types: Sequence[str] | None = None,
+) -> Sequence[Account]:
+    """What the next keyboard would offer, asked BEFORE a pending row is written.
+
+    Every `start_*` command used to write its row and only then discover there
+    was no account to spend from, which left a committed row nobody could answer
+    — an orphan `pending_entries` id that a hand-made `callback_data` could still
+    commit against for the next 24 hours. Asking first costs nothing: the answer
+    is passed straight to `_account_choice` as `available`, so it is one query
+    either way.
+    """
+    return await core_accounts.recent_accounts(
+        session,
+        household_id=actor.household_id,
+        member_id=actor.member_id,
+        types=types,
+    )
+
+
 async def _account_choice(
     session: AsyncSession,
     actor: Actor,
@@ -156,15 +188,28 @@ async def _account_choice(
     empty_message: str = NO_ACCOUNTS,
     edit: bool = False,
     show_all: bool = False,
+    available: Sequence[Account] | None = None,
 ) -> Reply:
-    """Render an account keyboard, MRU-ordered, or explain that there is none."""
-    available = await core_accounts.recent_accounts(
-        session,
-        household_id=actor.household_id,
-        member_id=actor.member_id,
-        types=types,
-        exclude=exclude,
-    )
+    """Render an account keyboard, MRU-ordered, or explain that there is none.
+
+    `available` is the list this would otherwise look up. Anything that writes a
+    pending row has to know whether there is an account to offer BEFORE it
+    writes — otherwise "there is nowhere to put the money" leaves a committed row
+    behind with no keyboard pointing at it — so those callers query first, bail
+    on empty, and hand the result down rather than paying for it twice. Callers
+    that only re-render an existing row leave it None and this queries as before.
+
+    A caller passing `available` must pass the SAME `types` and `exclude` it
+    filtered on, or the check guarded a different list than the keyboard shows.
+    """
+    if available is None:
+        available = await core_accounts.recent_accounts(
+            session,
+            household_id=actor.household_id,
+            member_id=actor.member_id,
+            types=types,
+            exclude=exclude,
+        )
     if not available:
         return Reply(text=empty_message, edit=edit)
 
@@ -199,6 +244,13 @@ async def start_entry(
     if isinstance(parsed, ParseError):
         return Reply(text=esc(parsed.message))
 
+    # Before the row, not after it: an empty list means there is nowhere to put
+    # the money, and parking a row for a question that cannot be asked leaves an
+    # orphan. See `_offerable`.
+    available = await _offerable(session, actor)
+    if not available:
+        return Reply(text=NO_ACCOUNTS)
+
     occurred_at = occurred_at_utc(parsed.occurred_on, now)
     row = await pending.create(
         session,
@@ -228,6 +280,7 @@ async def start_entry(
         build_data=callbacks.pick_account,
         prompt=prompt,
         header=header,
+        available=available,
     )
 
 
@@ -242,6 +295,10 @@ async def start_transfer(
     parsed = parse(remainder, today=manila_today(now))
     if isinstance(parsed, ParseError):
         return Reply(text=esc(parsed.message))
+
+    available = await _offerable(session, actor)
+    if not available:
+        return Reply(text=NO_ACCOUNTS)
 
     occurred_at = occurred_at_utc(parsed.occurred_on, now)
     row = await pending.create(
@@ -270,6 +327,7 @@ async def start_transfer(
         build_data=callbacks.pick_source,
         prompt="From which account?",
         header=header,
+        available=available,
     )
 
 
@@ -293,6 +351,12 @@ async def start_settlement(
     parsed = parse(remainder, today=manila_today(now))
     if isinstance(parsed, ParseError):
         return Reply(text=esc(parsed.message))
+
+    # The card filter has to match the one on the keyboard below, or this would
+    # guard a different list than the one the user is about to be shown.
+    available = await _offerable(session, actor, types=("credit_card",))
+    if not available:
+        return Reply(text=NO_CARDS)
 
     occurred_at = occurred_at_utc(parsed.occurred_on, now)
     row = await pending.create(
@@ -324,13 +388,19 @@ async def start_settlement(
         header=header,
         types=("credit_card",),
         empty_message=NO_CARDS,
+        available=available,
     )
 
 
 # --- committing -------------------------------------------------------------
 
 
-def _confirmation(entry: Entry, account_name: str, now: dt.datetime) -> str:
+def _confirmation(entry: Entry, account_name: str) -> str:
+    """A receipt, dated by when the money moved rather than when it was tapped.
+
+    No `now`: `occurred_at` is the only instant a confirmation can honestly
+    name. `@yesterday` is recorded today and is still yesterday's money.
+    """
     label = KIND_LABELS.get(entry.kind, entry.kind.title())
     lines = [f"<b>{label} {format_minor(entry.amount_minor)}</b>"]
     if entry.note:
@@ -403,7 +473,7 @@ async def commit_account_choice(
         session, household_id=actor.household_id, account_id=account_id
     )
     name = account.name if account else str(account_id)
-    return Reply(text=_confirmation(entry, name, now), toast="Recorded", edit=True)
+    return Reply(text=_confirmation(entry, name), toast="Recorded", edit=True)
 
 
 async def pick_transfer_source(
@@ -632,6 +702,13 @@ async def _reopen_for_payer(
     would have to re-derive which. Removing the button removes the ambiguity
     instead of adding a rule that guesses at it.
     """
+    # Same order as the `start_*` commands, for the same reason. Near-unreachable
+    # here — the card that was just settled is itself an active account, so the
+    # list is not empty — but the file gets one shape for this rather than two.
+    available = await _offerable(session, actor)
+    if not available:
+        return Reply(text=NO_ACCOUNTS, edit=True)
+
     row = await pending.create(
         session,
         household_id=actor.household_id,
@@ -660,6 +737,7 @@ async def _reopen_for_payer(
         header=header,
         edit=True,
         show_all=True,
+        available=available,
     )
 
 

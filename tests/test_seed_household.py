@@ -215,12 +215,20 @@ def test_a_well_formed_spec_survives_whitespace_and_an_absent_billing_account():
 
 
 async def test_the_cli_rejects_a_malformed_account_spec_before_touching_the_db(
-    capsys: pytest.CaptureFixture[str],
+    guarded, capsys: pytest.CaptureFixture[str]
 ):
     """End of the same path, as the operator meets it: argparse turns the
-    `ArgumentTypeError` into exit code 2 and a message on stderr. It happens in
-    `parse_args`, so no engine is ever built and no database is reached — which
-    is also why this test needs no fixture."""
+    `ArgumentTypeError` into exit code 2 and a message on stderr.
+
+    Takes `guarded` (defined with the confirmation tests below) even though the
+    rejection happens in `parse_args`, before an engine could be built. That
+    ordering is the CLAIM under test, not a licence to run unprotected: without
+    the fixture this test calls `_main` with the real `get_settings` and the real
+    `make_engine`, so the only thing standing between it and the ambient
+    `DATABASE_URL` — the live household — is argparse failing first. If the
+    `--account` validation ever moves after the engine is built, the guard turns
+    that into a `_Reached` and a red test instead of a connection to production.
+    """
     with pytest.raises(SystemExit) as excinfo:
         await _main(
             [

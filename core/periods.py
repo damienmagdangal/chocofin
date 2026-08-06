@@ -125,6 +125,30 @@ def resolve(
         raise PeriodError(f"unknown period kind: {kind!r}") from None
 
 
+def require_aware(moment: datetime) -> datetime:
+    """Return `moment` if it carries a timezone; raise if it does not.
+
+    The ONE naive-datetime guard, so that every boundary refusing one refuses it
+    with the same type and the same words. It was already written out by hand in
+    three places before it was a function, and the places that mattered most —
+    the ledger writes — were not among them.
+
+    A naive datetime is not a UTC datetime. Handed to a TIMESTAMPTZ column it is
+    read in the session's timezone, and handed to `astimezone` it is read as the
+    box's local time; either way the instant stored is not the instant the caller
+    meant. Near Manila midnight the difference is a whole DAY, and therefore the
+    wrong month, the wrong period and the wrong budget — silently, because
+    nothing on screen says which day the ledger picked.
+
+    `utcoffset() is None` as well as `tzinfo is None`: a tzinfo that declines to
+    say what its offset is leaves the value exactly as unanchored as no tzinfo at
+    all, and `astimezone` treats it the same way.
+    """
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise PeriodError("naive datetime — every instant must carry a timezone")
+    return moment
+
+
 def manila_today(now: datetime, *, tz: ZoneInfo = MANILA) -> date:
     """The current date in Manila, given an aware instant.
 
@@ -132,9 +156,7 @@ def manila_today(now: datetime, *, tz: ZoneInfo = MANILA) -> date:
     supported way to derive it. Rejects naive datetimes rather than assuming
     they are UTC.
     """
-    if now.tzinfo is None:
-        raise PeriodError("naive datetime — every instant must carry a timezone")
-    return now.astimezone(tz).date()
+    return require_aware(now).astimezone(tz).date()
 
 
 def to_utc(day: date, *, tz: ZoneInfo = MANILA) -> datetime:

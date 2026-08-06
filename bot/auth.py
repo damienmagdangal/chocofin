@@ -136,12 +136,15 @@ def _markup(keyboard: Keyboard | None) -> InlineKeyboardMarkup | None:
     )
 
 
-async def _render(update: Update, reply: Reply) -> str | None:
-    """Put a `Reply` on screen and hand its toast back to the wrapper.
+async def _render(update: Update, reply: Reply) -> None:
+    """Put a `Reply` on screen.
 
     Reached only after `session_scope` has exited, so whatever this sends is
     already true: the money is committed, or it is gone and this is the error.
     There is no third state left for a message to be wrong about.
+
+    It is also reached AFTER the callback has been answered — see the wrapper.
+    Nothing here produces the toast, so nothing here has to run first.
     """
     markup = _markup(reply.keyboard)
     query = update.callback_query
@@ -155,7 +158,7 @@ async def _render(update: Update, reply: Reply) -> str | None:
             await query.edit_message_text(
                 reply.text, parse_mode=PARSE_MODE, reply_markup=markup
             )
-        return reply.toast
+        return
 
     message = update.effective_message
     if message is not None:
@@ -163,7 +166,6 @@ async def _render(update: Update, reply: Reply) -> str | None:
             await message.reply_text(
                 reply.text, parse_mode=PARSE_MODE, reply_markup=markup
             )
-    return reply.toast
 
 
 def _reject(update: Update, message: str) -> tuple[Reply | None, str]:
@@ -240,13 +242,25 @@ def authorised(handler: Handler) -> Callable[[Update, BotContext], Awaitable[Non
             # and it runs outside the transaction on every path: success,
             # rejection, and exception.
             if reply is not None:
-                toast = await _render(update, reply)
+                toast = reply.toast
             # EXACTLY once, on every path. Not answering leaves the client
             # spinning on the button forever, and answering twice is an API
             # error. Both are avoided by there being one call site, in a
             # `finally`, that no handler can skip or repeat.
+            #
+            # BEFORE `_render`, not after. A callback query is only valid for
+            # about 15 seconds, and `_render` is a Telegram round-trip — a slow
+            # send or a retry spends that budget and the answer then lands on an
+            # expired query, where the `suppress` below swallows it and the user
+            # is left holding a spinner on the path where everything worked.
+            # The toast is `reply.toast`, known without sending anything, so
+            # there is no reason for this to wait on the message.
             if query is not None:
                 with contextlib.suppress(TelegramError):
                     await query.answer(toast or None)
+            # Still after the commit, which is the ordering the module docstring
+            # is about. Both of these are post-COMMIT; only their order changed.
+            if reply is not None:
+                await _render(update, reply)
 
     return wrapper

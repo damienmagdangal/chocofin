@@ -5,12 +5,19 @@ boundary in UTC instead of Manila (misfiles 8 hours of entries), and using a
 closed interval instead of a half-open one (double-counts the boundary).
 """
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, tzinfo
 
 import pytest
 
 from core.errors import PeriodError
-from core.periods import MANILA, manila_today, occurred_at_utc, resolve, to_utc
+from core.periods import (
+    MANILA,
+    manila_today,
+    occurred_at_utc,
+    require_aware,
+    resolve,
+    to_utc,
+)
 
 # Manila is UTC+08:00, so local midnight is 16:00Z on the PREVIOUS day.
 MIDNIGHT_OFFSET = timedelta(hours=16)
@@ -202,6 +209,49 @@ def test_every_boundary_is_timezone_aware():
 def test_manila_today_rejects_naive_datetime():
     with pytest.raises(PeriodError):
         manila_today(datetime(2026, 8, 3, 15, 30))
+
+
+def test_require_aware_returns_an_aware_instant_untouched():
+    """It is a guard, not a conversion. Anything that silently attached a
+    timezone here would be inventing the offset it could not read."""
+    moment = utc(2026, 8, 3, 15, 30)
+
+    assert require_aware(moment) is moment
+    assert require_aware(datetime(2026, 8, 3, 23, 30, tzinfo=MANILA)).tzinfo is MANILA
+
+
+def test_require_aware_rejects_a_naive_instant_in_the_words_every_caller_shares():
+    """One message, so a naive value reads the same wherever it was refused.
+
+    `manila_today`, `bot.formatting.to_manila` and the ledger write boundaries
+    all route through here; three hand-copied checks are how they drift.
+    """
+    with pytest.raises(PeriodError) as excinfo:
+        require_aware(datetime(2026, 8, 3, 15, 30))
+    assert "every instant must carry a timezone" in str(excinfo.value)
+
+
+def test_require_aware_rejects_a_tzinfo_that_declines_to_give_an_offset():
+    """`tzinfo is not None` is not the same question as "is this anchored?".
+
+    A tzinfo whose `utcoffset` returns None leaves the value exactly as
+    unplaceable as a bare one, and `astimezone` raises on it rather than
+    converting — so checking only for `None` would let it through the guard and
+    fail later, somewhere with no idea what went wrong.
+    """
+
+    class Unhelpful(tzinfo):
+        def utcoffset(self, _dt):
+            return None
+
+        def dst(self, _dt):
+            return None
+
+        def tzname(self, _dt):
+            return "Unhelpful"
+
+    with pytest.raises(PeriodError):
+        require_aware(datetime(2026, 8, 3, 15, 30, tzinfo=Unhelpful()))
 
 
 def test_manila_today_crosses_at_16_00_utc():

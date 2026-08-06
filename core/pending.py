@@ -41,6 +41,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.models import PendingEntry
+from core.periods import require_aware
 
 # How long a keyboard stays live. Long enough to survive a night's sleep and a
 # redeploy, short enough that a button found in yesterday's scrollback does not
@@ -127,8 +128,19 @@ async def create(
     forever. It only ever removes rows already past their TTL, whose buttons
     are dead in any case, and only this member's, so it can never disturb
     someone else's open keyboard.
+
+    Both instants must be timezone-aware, and both are checked before the sweep
+    runs so that a rejected call writes nothing and deletes nothing.
+    `occurred_at` is the one that matters most: `claim` copies it straight into
+    `entries.occurred_at`, so a naive value logged near Manila midnight is filed
+    on the wrong day, and so in the wrong month and the wrong budget period —
+    the pending row is a write boundary for the ledger, one step removed.
+    `now` sets `expires_at` and bounds the sweep, and a naive one compared
+    against a TIMESTAMPTZ column is eight hours adrift in whichever direction
+    either deletes a live keyboard or keeps a dead one alive.
     """
-    moment = now or dt.datetime.now(dt.UTC)
+    require_aware(occurred_at)
+    moment = require_aware(now or dt.datetime.now(dt.UTC))
 
     await session.execute(
         delete(PendingEntry).where(

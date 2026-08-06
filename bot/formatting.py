@@ -2,7 +2,7 @@
 
 Two conversions live here and nowhere else:
 
-* BIGINT centavos -> "PHP 1,234.50". Done with `divmod` and string assembly:
+* BIGINT centavos -> "₱1,234.50". Done with `divmod` and string assembly:
   integer operations, never float, never Decimal. `120050 / 100` is 1200.5,
   which is exactly representable, but `1234.56 * 100` is 123455.99999999999 and
   the habit of routing money through float is how that gets in. Nothing here
@@ -22,8 +22,7 @@ from __future__ import annotations
 import datetime as dt
 import html
 
-from core.errors import PeriodError
-from core.periods import MANILA
+from core.periods import MANILA, require_aware
 
 PESO = "₱"
 
@@ -40,10 +39,10 @@ def esc(text: str) -> str:
 
 
 def format_minor(amount_minor: int) -> str:
-    """Centavos to a peso string: 120050 -> 'PHP 1,200.50'.
+    """Centavos to a peso string: 120050 -> '₱1,200.50'.
 
     Handles negatives, which balances produce: a card that owes money has a
-    negative balance and must read as -PHP 3,000.00, not PHP -3,000.00.
+    negative balance and must read as -₱3,000.00, not ₱-3,000.00.
     """
     sign = "-" if amount_minor < 0 else ""
     pesos, centavos = divmod(abs(amount_minor), 100)
@@ -72,9 +71,7 @@ def to_manila(moment: dt.datetime) -> dt.datetime:
     timestamp in `entries` is TIMESTAMPTZ and comes back aware; one that
     arrives naive is a bug upstream of here, not a value to render anyway.
     """
-    if moment.tzinfo is None:
-        raise PeriodError("naive datetime — every instant must carry a timezone")
-    return moment.astimezone(MANILA)
+    return require_aware(moment).astimezone(MANILA)
 
 
 def format_datetime(moment: dt.datetime) -> str:

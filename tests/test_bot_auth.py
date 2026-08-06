@@ -35,6 +35,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from telegram.error import TelegramError
 
 from bot import flows
 from bot.auth import (
@@ -346,6 +347,39 @@ async def test_a_rejected_callback_is_answered_exactly_once(
     # A callback query is answered with a toast, and nothing is put in the chat
     # by either route: the bot does not announce itself to someone who may not
     # use it, in front of everyone else in the room.
+    assert update.shown == []
+
+
+async def test_the_button_is_released_even_when_the_message_fails_to_send(
+    session: AsyncSession, factory: async_sessionmaker[AsyncSession]
+):
+    """The answer does not wait on a Telegram round-trip that may not return.
+
+    A callback query is valid for about 15 seconds. `_render` sends over HTTP,
+    and a slow send or a retry spends that budget — so if the answer came after
+    it, it would land on an expired query, be swallowed by the `suppress` around
+    it, and leave the user holding a spinning button on the path where the money
+    actually moved. Answering first removes the dependency entirely.
+
+    Here the send does not merely take too long, it fails outright. The toast is
+    `reply.toast`, which is known without sending anything, so the failure must
+    not cost the user their button.
+    """
+    world = await build_world(session)
+    handler = Recorder(toast="Done")
+    update = FakeUpdate(telegram_id=world.member_telegram_id, callback=True)
+
+    async def explode(text: str, **kwargs) -> None:
+        raise TelegramError("Bad Request: message to edit not found")
+
+    update.query.edit_message_text = explode
+    update.effective_message.reply_text = explode
+
+    await authorised(handler)(update, FakeContext(factory))
+
+    assert handler.called
+    assert update.query.answers == ["Done"]
+    # Nothing reached the chat, which is the point: the send is what failed.
     assert update.shown == []
 
 

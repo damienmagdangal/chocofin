@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from core import pending
+from core.errors import PeriodError
 from core.models import PendingEntry
 from tests.factories import JAN_15, World, build_world
 
@@ -34,6 +35,7 @@ async def _create(
     household_id: int | None = None,
     intent: str = "expense",
     parsed_kind: str = "expense",
+    occurred_at: dt.datetime = JAN_15,
     now: dt.datetime = NOW,
     **kwargs,
 ) -> PendingEntry:
@@ -45,7 +47,7 @@ async def _create(
         intent=intent,
         parsed_kind=parsed_kind,
         parsed_amount_minor=10_000,
-        occurred_at=JAN_15,
+        occurred_at=occurred_at,
         now=now,
         **kwargs,
     )
@@ -98,6 +100,47 @@ async def test_intent_is_recorded_not_inferred(session: AsyncSession):
 
     assert row.intent == "settlement"
     assert row.parsed_kind == "transfer"
+
+
+async def test_a_naive_occurred_at_is_refused_rather_than_parked(
+    session: AsyncSession,
+):
+    """This row is a ledger write boundary one step removed.
+
+    `claim` copies `occurred_at` straight into `entries.occurred_at`, so a naive
+    value accepted here is a naive value in the ledger — and Manila is UTC+08:00,
+    so an entry started near local midnight is filed on the wrong DAY, and at a
+    month boundary in the wrong MONTH and the wrong budget period. Refusing it
+    at the `create` that starts the flow means the user is told at once, while
+    the message they typed is still on screen, rather than after they have
+    tapped an account and been shown a receipt for money filed somewhere else.
+    """
+    world = await build_world(session)
+
+    with pytest.raises(PeriodError):
+        await _create(session, world, occurred_at=dt.datetime(2026, 1, 15, 4, 0))
+
+    # Nothing parked, and — because the check runs before the expiry sweep — no
+    # other keyboard of this member's quietly deleted on the way out either.
+    assert await _count(session) == 0
+
+
+async def test_a_naive_now_is_refused_rather_than_setting_expires_at(
+    session: AsyncSession,
+):
+    """`now` is the second instant this function stores.
+
+    It becomes `expires_at` and it bounds the sweep that deletes this member's
+    dead rows. A naive one is eight hours out against a TIMESTAMPTZ column,
+    which in one direction sweeps away a keyboard that is still live and in the
+    other keeps answering taps on one that should have expired a day ago.
+    """
+    world = await build_world(session)
+
+    with pytest.raises(PeriodError):
+        await _create(session, world, now=dt.datetime(2026, 1, 15, 6, 30))
+
+    assert await _count(session) == 0
 
 
 # --- get --------------------------------------------------------------------

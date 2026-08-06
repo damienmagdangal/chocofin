@@ -29,7 +29,7 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot import flows
+from bot import callbacks, flows, keyboards
 from bot.auth import Actor
 from bot.callbacks import decode
 from bot.formatting import account_label
@@ -868,6 +868,116 @@ async def test_no_accounts_when_nothing_is_active_or_owed(session: AsyncSession)
     assert reply.keyboard is None
 
 
+# --- nothing is parked for a question that cannot be asked -------------------
+#
+# Every `start_*` command wrote its pending row and only THEN looked for an
+# account to offer. With none to offer the user was told there was nowhere to
+# put the money and the row stayed behind, committed, with no keyboard pointing
+# at it — an orphan id a hand-made `callback_data` could still commit against
+# for the next 24 hours. `_nothing_written` is the assertion that was missing on
+# exactly these paths.
+
+
+async def _deactivate_every_account(session: AsyncSession, world: World) -> None:
+    """A household with accounts on the books but none in use.
+
+    Not a household with no rows at all: `_require_account` does not filter on
+    `is_active`, so this leaves every id still resolvable while
+    `recent_accounts` — which does filter — returns nothing. That is the state
+    the empty-keyboard branch is actually reached in.
+    """
+    await session.execute(
+        update(Account)
+        .where(Account.household_id == world.household_id)
+        .values(is_active=False)
+    )
+
+
+async def test_an_expense_with_no_accounts_parks_nothing(session: AsyncSession):
+    world = await build_world(session)
+    await _deactivate_every_account(session, world)
+
+    reply = await flows.start_entry(
+        session, _actor(world), raw="120 coffee", now=JAN_15
+    )
+
+    assert reply.text == flows.NO_ACCOUNTS
+    assert reply.keyboard is None
+    await _nothing_written(session, world)
+
+
+async def test_a_transfer_with_no_accounts_parks_nothing(session: AsyncSession):
+    world = await build_world(session)
+    await _deactivate_every_account(session, world)
+
+    reply = await flows.start_transfer(
+        session, _actor(world), raw="/transfer 500", now=JAN_15
+    )
+
+    assert reply.text == flows.NO_ACCOUNTS
+    assert reply.keyboard is None
+    await _nothing_written(session, world)
+
+
+async def test_a_settlement_with_no_cards_parks_nothing(session: AsyncSession):
+    """Only the cards go. The household still has somewhere to spend from.
+
+    So this also pins that the pre-check filters on the SAME `types` as the
+    keyboard it is guarding: a check that asked for every account would find the
+    cash account, sail past, and park a row for a card question with no cards.
+    """
+    world = await build_world(session)
+    await session.execute(
+        update(Account)
+        .where(
+            Account.household_id == world.household_id,
+            Account.type == "credit_card",
+        )
+        .values(is_active=False)
+    )
+
+    reply = await flows.start_settlement(
+        session, _actor(world), raw="/pay 3000", now=JAN_15
+    )
+
+    assert reply.text == flows.NO_CARDS
+    assert reply.keyboard is None
+    await _nothing_written(session, world)
+
+
+async def test_reopening_for_a_payer_with_no_accounts_parks_nothing(
+    session: AsyncSession,
+):
+    """The second question, asked of a household that cannot answer it.
+
+    The narrow path: the card names no billing account, so `settle_card` raises
+    and `_reopen_for_payer` would normally create a replacement row. The claim
+    has already removed the first one, so a replacement that nobody can answer
+    would be the only row left in the table — an orphan created by the recovery
+    from a failure, which is the worst place to leave one.
+
+    Reachable because `_require_account` does not filter `is_active`: the orphan
+    card is still settleable after `recent_accounts` has stopped offering it.
+    """
+    world = await build_world(session)
+    actor = _actor(world)
+
+    started = await flows.start_settlement(session, actor, raw="/pay 3000", now=JAN_15)
+    pending_id, orphan_id = _tap(started.keyboard, world.orphan_card_id)
+
+    # Only now, so the settlement gets as far as needing a payer.
+    await _deactivate_every_account(session, world)
+
+    reply = await flows.commit_destination(
+        session, actor, pending_id=pending_id, account_id=orphan_id, now=JAN_15
+    )
+
+    assert reply.text == flows.NO_ACCOUNTS
+    assert reply.keyboard is None
+    assert reply.edit is True
+    await _nothing_written(session, world)
+
+
 # ============================================================================
 # Happy path and rejection, one command at a time.
 #
@@ -1217,6 +1327,147 @@ async def test_paying_a_card_moves_money_from_the_billing_account(
     assert kinds == ["expense", "transfer"]
 
 
+async def test_a_card_with_no_billing_account_asks_who_is_paying(
+    session: AsyncSession,
+):
+    """The whole orphan-card settlement, tap by tap.
+
+    A card that names no billing account is the one settlement that cannot be
+    finished in a single tap: `settle_card` has nowhere to read the payer from
+    and raises. `_reopen_for_payer` answers that by CLAIMING the pending row and
+    creating a fresh one, which is the only place in the bot where an in-flight
+    entry is carried from one row to another — so every field has to make the
+    hop, and until now nothing said so.
+
+    Backdated on purpose. `now` is March and the entry is January, so a
+    replacement row that stamped `now()` instead of copying `occurred_at` would
+    file the settlement two months late — invisible in a test where the two are
+    the same day.
+    """
+    world = await build_world(session)
+    actor = _actor(world)
+
+    started = await flows.start_settlement(
+        session, actor, raw="/pay 3000 visa bill #card @2026-01-15", now=MAR_20
+    )
+    first_pending_id, orphan_id = _tap(started.keyboard, world.orphan_card_id)
+
+    reopened = await flows.commit_destination(
+        session, actor, pending_id=first_pending_id, account_id=orphan_id, now=MAR_20
+    )
+
+    assert "That card has no billing account set." in reopened.text
+    assert "Settlement ₱3,000.00" in reopened.text
+    assert reopened.edit is True
+
+    # Nothing was written, and the row that was claimed is really gone: this is
+    # a second question, not a half-finished entry left lying about.
+    assert (
+        await session.scalar(
+            select(Entry).where(Entry.household_id == world.household_id)
+        )
+    ) is None
+    assert (await session.get(PendingEntry, first_pending_id)) is None
+
+    (row,) = list(
+        await session.scalars(
+            select(PendingEntry).where(PendingEntry.household_id == world.household_id)
+        )
+    )
+    assert row.id != first_pending_id
+    assert _pending_id(reopened.keyboard) == row.id
+
+    # The load-bearing assertions of the hop: everything the user already typed
+    # is on the replacement row, so the second question is the ONLY question.
+    assert row.intent == "settlement"
+    assert row.parsed_kind == "transfer"
+    assert row.parsed_amount_minor == 300_000
+    assert row.parsed_note == "visa bill"
+    assert list(row.parsed_tags) == ["card"]
+    assert row.occurred_at == to_utc(dt.date(2026, 1, 15))
+    assert row.raw_input == "/pay 3000 visa bill #card @2026-01-15"
+    assert row.member_id == world.member_id
+    assert row.source_account_id is None
+
+    # The FULL account list, and therefore no [Other…]: a settlement with no
+    # source is the one state `intent` cannot disambiguate, so the button that
+    # would have to guess which question is being re-asked is not sent at all.
+    buttons = _account_buttons(reopened.keyboard)
+    assert len(buttons) > keyboards.MRU_LIMIT
+    assert all(button.data.startswith("t:") for button, _ in buttons)
+    assert world.cash_id in _account_ids(reopened.keyboard)
+    assert not [
+        button
+        for keyboard_row in reopened.keyboard
+        for button in keyboard_row
+        if button.data.startswith("o:")
+    ]
+
+    # Answer it: Cash is paying.
+    second_pending_id, payer_id = _tap(reopened.keyboard, world.cash_id)
+    assert second_pending_id == row.id
+    second = await flows.pick_transfer_source(
+        session, actor, pending_id=second_pending_id, account_id=payer_id, now=MAR_20
+    )
+
+    # And the question after THAT is still the card question. `intent` is what
+    # keeps it from widening into a plain transfer's "To which account?".
+    assert "Which card?" in second.text
+    assert "To which account?" not in second.text
+    assert all(
+        button.data.startswith("d:") for button, _ in _account_buttons(second.keyboard)
+    )
+    assert _account_ids(second.keyboard) == {world.card_id, world.orphan_card_id}
+
+    stored = await session.get(PendingEntry, second_pending_id)
+    assert stored is not None
+    assert stored.source_account_id == world.cash_id
+
+    _, target_id = _tap(second.keyboard, world.orphan_card_id)
+    recorded = await flows.commit_destination(
+        session, actor, pending_id=second_pending_id, account_id=target_id, now=MAR_20
+    )
+    await session.commit()
+
+    assert recorded.toast == "Recorded"
+    assert "Transfer ₱3,000.00" in recorded.text
+    assert "Cash → Orphan Card" in recorded.text
+
+    entry = await _only_entry(session, world)
+    # Still a settlement all the way to the ledger: a transfer, never an expense,
+    # even though its payer was chosen by hand.
+    assert entry.kind == "transfer"
+    assert entry.amount_minor == 300_000
+    assert entry.note == "visa bill"
+    assert entry.occurred_at == to_utc(dt.date(2026, 1, 15))
+    assert entry.member_id == world.member_id
+    assert entry.raw_input == "/pay 3000 visa bill #card @2026-01-15"
+
+    tags = list(
+        await session.scalars(select(EntryTag.tag).where(EntryTag.entry_id == entry.id))
+    )
+    assert tags == ["card"]
+
+    legs = await _legs(session, world, entry)
+    assert set(legs) == {"source", "destination"}
+    # The hand-chosen payer really is the source leg. That is the whole reason
+    # the second question was asked.
+    assert legs["source"].account_id == world.cash_id
+    assert legs["source"].amount_minor == -300_000
+    assert legs["destination"].account_id == world.orphan_card_id
+    assert legs["destination"].amount_minor == 300_000
+    assert legs["source"].amount_minor + legs["destination"].amount_minor == 0
+
+    assert await _balance(session, world, world.cash_id) == -300_000
+    assert await _balance(session, world, world.orphan_card_id) == 300_000
+    # Nothing parked afterwards: the replacement row was claimed by the commit.
+    assert (
+        await session.scalar(
+            select(PendingEntry).where(PendingEntry.household_id == world.household_id)
+        )
+    ) is None
+
+
 async def test_pay_with_no_amount_asks_for_one(session: AsyncSession):
     """`/pay` alone cannot be guessed at. The amount is the one thing no
     keyboard can supply."""
@@ -1520,6 +1771,133 @@ async def test_voiding_the_same_entry_twice_is_refused_on_both_surfaces(
     assert (await session.get(Entry, entry.id)).voided_at == first_voided_at
 
 
+# --- [Cancel] and the prompt that has nothing behind it ----------------------
+#
+# Two buttons that look identical on screen and are not the same thing.
+# `cancel_pending` DELETES a pending row; `dismiss` closes a prompt that never
+# created one — the [Cancel] beside [Void it]. `tests/test_bot_callbacks.py`
+# pins their payloads ("x:7" and "n"), which says nothing at all about what
+# happens when either is tapped.
+
+
+async def test_cancel_drops_the_pending_row_and_writes_nothing(session: AsyncSession):
+    """[Cancel] on an account keyboard: the entry never existed.
+
+    The button is taken off the real keyboard rather than assumed, so this
+    covers the wiring as well as the flow — a [Cancel] carrying the wrong id
+    would cancel a different message's keyboard and leave this one live.
+
+    The second tap is the case that matters as much as the first. Both buttons
+    stay on screen until the message is edited, and a double tap is the normal
+    way to use a phone.
+    """
+    world = await build_world(session)
+    actor = _actor(world)
+
+    started = await flows.start_entry(session, actor, raw="120 coffee", now=JAN_15)
+    pending_id = _pending_id(started.keyboard)
+    cancel_button = started.keyboard[-1][-1]
+    assert cancel_button.label == keyboards.CANCEL_LABEL
+    assert cancel_button.data == callbacks.cancel_pending(pending_id)
+
+    cancelled = await flows.cancel_pending(session, actor, pending_id=pending_id)
+    await session.commit()
+
+    assert cancelled.text == flows.CANCELLED
+    assert cancelled.toast == flows.CANCELLED
+    assert cancelled.edit is True
+    # The dead keyboard comes off screen rather than being redrawn.
+    assert cancelled.keyboard is None
+    await _nothing_written(session, world)
+
+    again = await flows.cancel_pending(session, actor, pending_id=pending_id)
+    await session.commit()
+
+    assert again.text == flows.ALREADY_DONE
+    assert again.toast == flows.ALREADY_DONE
+    assert again.edit is True
+    await _nothing_written(session, world)
+
+
+async def test_a_housemate_cannot_cancel_your_pending_entry(session: AsyncSession):
+    """The member scope reaches [Cancel] too, and it has to.
+
+    `pending.cancel` is `claim` underneath, which is what carries the member
+    predicate along. Without it a housemate tapping the [Cancel] under someone
+    else's message — every keyboard in a shared chat is visible to everyone —
+    would make their entry vanish mid-flow with no explanation and nothing to
+    tap.
+    """
+    world = await build_world(session)
+    typist = _actor(world)
+    housemate = _housemate(world)
+
+    started = await flows.start_entry(session, typist, raw="120 coffee", now=JAN_15)
+    pending_id = _pending_id(started.keyboard)
+
+    refused = await flows.cancel_pending(session, housemate, pending_id=pending_id)
+    await session.commit()
+
+    # The same answer a dead button gets: a housemate learns nothing about what
+    # anyone else has in flight.
+    assert refused.text == flows.ALREADY_DONE
+    assert refused.toast == flows.ALREADY_DONE
+    assert (await session.get(PendingEntry, pending_id)) is not None
+
+    # And the typist's keyboard is still live — refusing everyone would satisfy
+    # the assertions above and break the bot.
+    recorded = await flows.commit_account_choice(
+        session, typist, pending_id=pending_id, account_id=world.cash_id, now=JAN_15
+    )
+    await session.commit()
+
+    assert recorded.toast == "Recorded"
+    entry = await _only_entry(session, world)
+    assert entry.member_id == world.member_id
+
+
+async def test_dismiss_closes_a_void_prompt_without_touching_the_entry(
+    session: AsyncSession,
+):
+    """[Cancel] beside [Void it] — the one button with no pending row behind it.
+
+    Walking away from a void confirmation must leave the money exactly where it
+    was. `dismiss` therefore takes no session and no id at all, and this is what
+    that buys: the entry is still there, still not voided, and the balance has
+    not moved.
+    """
+    world = await build_world(session)
+    actor = _actor(world)
+
+    entry = await _log(
+        session, actor, "1000 rent", now=JAN_15, account_id=world.cash_id
+    )
+    asked = await flows.start_void(session, actor)
+    (confirm, cancel), *_ = asked.keyboard
+    assert decode(confirm.data).first == entry.id
+    # No id on this one. There is no row to name.
+    assert cancel.data == callbacks.dismiss()
+
+    dismissed = flows.dismiss()
+
+    assert dismissed.text == flows.CANCELLED
+    assert dismissed.toast == flows.CANCELLED
+    assert dismissed.edit is True
+    assert dismissed.keyboard is None
+
+    # The load-bearing assertions: the entry survived being asked about.
+    row = await session.get(Entry, entry.id)
+    assert row is not None
+    assert row.voided_at is None
+    assert await _balance(session, world, world.cash_id) == -100_000
+    # And asking the question parked nothing that a later tap could commit.
+    assert (
+        await session.scalar(
+            select(PendingEntry).where(PendingEntry.household_id == world.household_id)
+        )
+    ) is None
+
+
 # --- /start and /help -------------------------------------------------------
 
 
@@ -1649,6 +2027,84 @@ async def test_text_with_no_amount_is_refused_and_so_is_an_unknown_command(
     assert "is not an amount" in mistyped.text
     assert "₱120.00" not in mistyped.text
     assert mistyped.keyboard is None
+
+    await session.commit()
+    await _nothing_written(session, world)
+
+
+# --- a newline where a space was expected -----------------------------------
+#
+# `_strip_command` split on a literal " ". A mobile keyboard sends "/transfer"
+# + newline + "500" routinely — autocomplete puts the command in, the user hits
+# return, then types the amount — and `partition(" ")` found no space in that
+# message at all: the whole thing stayed as the head, nothing was stripped, and
+# the parser was handed the word "transfer", which it refuses outright. The user
+# saw an amount rejection for a message that named a perfectly good amount.
+#
+# The other half of the same bug lives in `bot.handlers._argument`, where the
+# consequence was worse than a rejection — see `tests/test_bot_handlers.py`.
+
+
+@pytest.mark.parametrize("separator", [" ", "\n", "\n\n", " \n ", "\t"])
+async def test_a_command_and_its_amount_survive_any_whitespace(
+    session: AsyncSession, separator: str
+):
+    """Whatever separates the command from its argument, the amount gets through.
+
+    Asserted against the plain-space reply rather than against a fixed string:
+    what has to hold is that the separator makes NO difference, which is a
+    stronger claim than any one rendering of it.
+    """
+    world = await build_world(session)
+    actor = _actor(world)
+
+    expected = await flows.start_transfer(
+        session, actor, raw="/transfer 500 top-up", now=JAN_15
+    )
+    reply = await flows.start_transfer(
+        session, actor, raw=f"/transfer{separator}500 top-up", now=JAN_15
+    )
+
+    assert reply.text == expected.text
+    assert "Transfer ₱500.00" in reply.text
+    assert "top-up" in reply.text
+    # A keyboard at all: the rejection path returns none, and that is exactly
+    # what the user used to get here.
+    assert _account_ids(reply.keyboard) == _account_ids(expected.keyboard)
+
+
+async def test_pay_reads_its_amount_across_a_newline(session: AsyncSession):
+    """`/pay` shares `_strip_command`, so it shared the bug."""
+    world = await build_world(session)
+    actor = _actor(world)
+
+    reply = await flows.start_settlement(session, actor, raw="/pay\n3000", now=JAN_15)
+
+    assert "Settlement ₱3,000.00" in reply.text
+    assert "Which card?" in reply.text
+    assert reply.keyboard is not None
+
+
+async def test_a_command_with_nothing_after_it_still_asks_for_an_amount(
+    session: AsyncSession,
+):
+    """The empty case, which the new split has to keep answering the same way.
+
+    A bare `/transfer` and a `/transfer` followed by nothing but whitespace are
+    the same message: no amount was given, so the usage line is the reply. A
+    split that returned the command itself as the remainder would send the word
+    "transfer" to the parser and report it as a bad amount instead.
+    """
+    world = await build_world(session)
+    actor = _actor(world)
+
+    for raw in ("/transfer", "/transfer ", "/transfer\n", "/transfer \n "):
+        reply = await flows.start_transfer(session, actor, raw=raw, now=JAN_15)
+        assert reply.text == flows.TRANSFER_USAGE, raw
+        assert reply.keyboard is None, raw
+
+    settlement = await flows.start_settlement(session, actor, raw="/pay\n", now=JAN_15)
+    assert settlement.text == flows.PAY_USAGE
 
     await session.commit()
     await _nothing_written(session, world)

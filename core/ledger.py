@@ -14,6 +14,9 @@ Rules encoded here, each of which has a test:
 * Summaries never consult `exclude_from_totals`. Money spent from an excluded
   account is still spending; that flag is balance-only.
 * No account is ever defaulted. Callers pass `account_id` explicitly.
+* Every instant this module stores — `occurred_at`, and an explicitly supplied
+  `voided_at` — must be timezone-aware. The write boundaries call
+  `core.periods.require_aware` before touching anything, via `_require_when`.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ from core.errors import (
     SameAccountTransferError,
 )
 from core.models import Account, Category, Entry, EntryLeg, EntryTag
+from core.periods import require_aware
 
 EntrySource = Literal["telegram", "web"]
 GroupBy = Literal["parent", "leaf"]
@@ -105,6 +109,31 @@ def _require_positive(amount_minor: int) -> None:
         raise InvalidAmountError(f"amount_minor must be positive, got {amount_minor}")
 
 
+def _require_when(moment: dt.datetime) -> None:
+    """Refuse a naive instant before anything is written.
+
+    Called on `occurred_at` at every entry point, and on an explicitly supplied
+    `voided_at`. The first is the one that moves money into the wrong period;
+    the second only misdates the correction, but both are stored, and there is
+    no reason for this module to hold two standards for what a datetime is.
+
+    This is the write boundary. `core.periods` rejects a naive instant on the
+    way IN to a period calculation, and `bot.formatting` on the way OUT to a
+    screen, but a caller that builds an `occurred_at` some other way reached the
+    ledger unchecked — and this is the column every period, every monthly total
+    and every budget window is cut on. `datetime.now()` without a tz, or a value
+    parsed from a config file, lands the entry up to eight hours early: an
+    expense logged just after Manila midnight is filed on the previous DAY, and
+    at a month boundary in the previous MONTH, where no total will ever show it
+    to the person looking for it.
+
+    A shared helper rather than a check per function, so that adding a fifth way
+    to write an entry cannot quietly skip it — `PeriodError` and its wording come
+    from `core.periods`, the one place that owns what "naive" means here.
+    """
+    require_aware(moment)
+
+
 async def _require_account(
     session: AsyncSession, *, household_id: int, account_id: int
 ) -> Account:
@@ -167,6 +196,7 @@ async def _create_single_leg_entry(
     replaces_entry_id: int | None = None,
 ) -> Entry:
     _require_positive(amount_minor)
+    _require_when(occurred_at)
     await _require_account(session, household_id=household_id, account_id=account_id)
 
     entry = Entry(
@@ -310,6 +340,7 @@ async def create_transfer(
     fee leg would break sum-to-zero and would hide real spending from totals.
     """
     _require_positive(amount_minor)
+    _require_when(occurred_at)
     if source_account_id == destination_account_id:
         raise SameAccountTransferError(
             f"transfer source and destination are both account {source_account_id}"
@@ -362,7 +393,13 @@ async def create_transfer(
             session,
             household_id=household_id,
             member_id=member_id,
-            account_id=fee_account_id or source_account_id,
+            # `is not None`, never `or` — the same rule `settle_card` spells out
+            # below. `or` reads an id of 0 as "no fee account given" and books
+            # the fee to the transfer's source instead of failing on an account
+            # that does not exist.
+            account_id=(
+                fee_account_id if fee_account_id is not None else source_account_id
+            ),
             amount_minor=fee_minor,
             occurred_at=occurred_at,
             category_id=fee_category_id,
@@ -505,7 +542,17 @@ async def void_entry(
     """Mark an entry void. The row stays readable forever.
 
     Stamping `voided_at` is the ONLY mutation permitted on `entries`.
+
+    An explicit `voided_at` must be aware, like every other instant this module
+    stores. It moves no money and cuts no period — which is why it is the last
+    datetime here to get the guard — but it is what says WHEN a correction was
+    made, and an eight-hour drift is enough to reorder a void against the
+    replacement that followed it. The default is `now(UTC)` and is aware
+    already; only a caller supplying its own can get this wrong, and a caller
+    supplying its own is a caller reconstructing history.
     """
+    if voided_at is not None:
+        _require_when(voided_at)
     entry = await get_entry(session, household_id=household_id, entry_id=entry_id)
     if entry.voided_at is not None:
         raise EntryAlreadyVoidedError(f"entry {entry_id} is already voided")
