@@ -1,0 +1,131 @@
+# ChocoFin household ledger bot -- systemd unit.
+#
+#   install -m 0644 deploy/chocofin-bot.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now chocofin-bot.service
+#
+# Provisioning, the environment file, first-run verification and rollback are
+# all in docs/DEPLOY.md. Nothing in this file may contain a credential, a
+# hostname or an IP -- those live in /etc/chocofin/chocofin.env, mode 0600.
+
+[Unit]
+Description=ChocoFin household ledger Telegram bot
+Documentation=file:/opt/chocofin/docs/DEPLOY.md
+
+# The database is on a separate LXC, so this needs a routable address before it
+# starts. network.target only means "networking has been configured", which can
+# be true while no address exists yet.
+#
+# There is deliberately no After=postgresql.service: Postgres does not run on
+# this host, and ordering against a unit that is not present here is silently a
+# no-op that reads like protection.
+After=network-online.target
+Wants=network-online.target
+
+# Never give up. The default rate limit (5 starts within 10s, then stop
+# permanently) turns a transient DNS failure or a Postgres restart into a bot
+# that stays dead until a human notices -- and nobody notices a Telegram bot
+# that is merely quiet. Restart=on-failure below is the entire supervision
+# strategy for this service; capping it defeats the purpose.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=chocofin
+Group=chocofin
+WorkingDirectory=/opt/chocofin
+
+# Mode 0600, owned by chocofin:chocofin. Holds TELEGRAM_BOT_TOKEN and
+# DATABASE_URL -- the two values core/config.py deliberately refuses to hold in
+# code. systemd reads this as root before dropping privileges.
+EnvironmentFile=/etc/chocofin/chocofin.env
+
+# ProtectSystem=strict makes /opt read-only, so CPython cannot write
+# __pycache__ and would retry on every import for the life of the process.
+# DEPLOY.md pre-compiles at install time instead, so nothing is lost here.
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Unbuffered, so a hard crash cannot swallow the last few log lines.
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/chocofin/.venv/bin/python -m bot
+
+Restart=on-failure
+RestartSec=10s
+
+# python-telegram-bot installs its own clean-shutdown handler for SIGTERM (as
+# well as SIGINT and SIGABRT), so the default KillSignal is already the right
+# one: it stops the poller, then runs post_shutdown, which disposes the
+# database engine and returns the pooled asyncpg connections. Give that room to
+# finish rather than being SIGKILLed mid-transaction.
+TimeoutStopSec=30s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chocofin-bot
+
+# --- Hardening -------------------------------------------------------------
+#
+# This process opens two outbound TCP connections (Telegram's HTTPS API and
+# Postgres on another LXC), writes nothing outside its own memory, and listens
+# on nothing at all. Long polling is what makes that true -- see bot/__main__.py.
+# A process with no inbound surface and no files to write can have almost
+# everything taken away from it.
+#
+# Check the result after any edit here:  systemd-analyze security chocofin-bot
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+# No listening socket means no port to bind, which means no capability to keep.
+# An empty bounding set is the strongest form of that and costs this service
+# nothing, because it never needed a capability in the first place.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+UMask=0077
+
+# AF_INET/AF_INET6 for Telegram and Postgres; AF_UNIX for DNS resolution and
+# the journal socket. Nothing else -- no netlink, no packet sockets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# asyncpg, and every other C extension in this dependency set, are ordinary
+# shared objects; none of them JITs. If the service ever fails to start with a
+# SIGSYS or an mmap/mprotect error after a dependency bump, THIS is the first
+# directive to comment out -- and once it starts, treat the dependency that
+# needs W+X memory as the thing worth looking at, not this line.
+MemoryDenyWriteExecute=yes
+
+# Deliberately omitted:
+#
+#   PrivateUsers=yes -- the directive most likely to misbehave inside an
+#   unprivileged LXC, where the container's own uid mapping already does this
+#   job. It also buys little for a process whose capability set is empty.
+#
+#   IPAddressDeny/IPAddressAllow -- these are enforced with eBPF, which an
+#   unprivileged container generally cannot install. They would either fail the
+#   unit or, worse, be silently ignored while looking like an egress filter.
+#   Restrict egress on the LXC or the host firewall instead; DEPLOY.md says so.
+
+[Install]
+WantedBy=multi-user.target

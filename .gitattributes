@@ -1,0 +1,8 @@
+# This repo is authored on Windows (core.autocrlf=true) and deployed to Debian.
+# A shell script checked out with CRLF fails on Linux with a baffling
+# "bad interpreter: /bin/bash^M", and a systemd unit with CRLF is parsed as
+# though every value had a trailing carriage return. Pin the deployment
+# artifacts to LF so the working tree cannot decide otherwise.
+*.sh              text eol=lf
+*.service         text eol=lf
+deploy/**         text eol=lf
