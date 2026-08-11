@@ -1,0 +1,14 @@
+# Secret scanning. See docs/secret-scanning.md.
+#
+# Scope is deliberately narrow: this file exists to stop a credential reaching
+# the history, not to run the linters. `ruff` and `pytest` stay manual commands
+# (see CLAUDE.md) so that a slow or failing lint can never be the reason someone
+# reaches for `--no-verify` and disables the secret scan along with it.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      # Runs `gitleaks git --pre-commit --redact --staged --verbose`, so it sees
+      # the staged diff only and prints findings with the secret redacted.
+      # Rules and allowlists come from .gitleaks.toml at the repo root.
+      - id: gitleaks

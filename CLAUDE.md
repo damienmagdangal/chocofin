@@ -9,6 +9,10 @@ Telegram-first expense/income tracker for one household. Self-hosted.
 - Migrate: `alembic upgrade head`
 - Run bot locally: `python -m bot`
 - Run API locally: `uvicorn api.main:app --reload`
+- Secret scanning (once per clone): `uv run pre-commit install`. A gitleaks
+  pre-commit hook blocks any commit containing a credential. Never bypass it
+  with `--no-verify`; fix the rule in `.gitleaks.toml` instead.
+  Setup and false-positive handling: @docs/secret-scanning.md
 
 ## Architecture
 - `core/` owns ALL ledger logic and is the ONLY module that writes to the DB.

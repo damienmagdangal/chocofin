@@ -1,0 +1,73 @@
+title = "ChocoFin secret scanning"
+
+# Start from the upstream ruleset and add to it. The default rules already cover
+# the credential this repo is most likely to leak: `telegram-bot-api-token`
+# matches a bot token when the word "telegr" appears nearby, which is exactly
+# what a stray `TELEGRAM_BOT_TOKEN=...` line looks like.
+[extend]
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Repo-specific rules
+# ---------------------------------------------------------------------------
+
+# The default ruleset has no rule for database connection URLs, and this repo
+# has two of them (`DATABASE_URL`, `TEST_DATABASE_URL` — see core/config.py and
+# CLAUDE.md). The shared Postgres LXC holds live household data, so a URL with
+# an inline password is the highest-value secret here after the bot token.
+#
+# secretGroup = 1 points at the password so --redact hides the password rather
+# than the whole URL, which keeps the finding readable enough to act on.
+[[rules]]
+id = "chocofin-database-url-password"
+description = "Database connection URL with an inline password"
+regex = '''(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb)(?:\+[a-z0-9_]+)?://[^\s:/@]+:([^\s/@]+)@'''
+secretGroup = 1
+keywords = ["postgres", "postgresql", "mysql", "mariadb", "mongodb"]
+tags = ["database", "credential"]
+
+  # Documentation and test fixtures have to show the URL shape somehow. Allow
+  # the obvious placeholders, and anything that is plainly a shell or CI
+  # variable reference rather than a literal.
+  [[rules.allowlists]]
+  description = "Placeholder and interpolated passwords, not real credentials"
+  condition = "OR"
+  regexTarget = "secret"
+  regexes = [
+    '''^\$\{[^}]+\}$''',   # ${POSTGRES_PASSWORD}
+    '''^\$[A-Za-z_][A-Za-z0-9_]*$''', # $POSTGRES_PASSWORD
+    '''^%[A-Za-z_][A-Za-z0-9_]*%$''', # %POSTGRES_PASSWORD%
+    '''^<[^>]+>$''',       # <password>
+    '''^\.\.\.$''',
+  ]
+  stopwords = [
+    "password",
+    "changeme",
+    "example",
+    "placeholder",
+    "redacted",
+    "your-",
+  ]
+
+# ---------------------------------------------------------------------------
+# Global allowlists
+# ---------------------------------------------------------------------------
+
+# The pre-commit hook only ever sees the staged diff, so .venv/ cannot reach it.
+# This entry is for ad-hoc whole-tree scans (`gitleaks dir .`), where the vendored
+# site-packages otherwise produce a wall of generic-api-key false positives from
+# SQLAlchemy's own source and drown out anything real.
+[[allowlists]]
+description = "Vendored dependencies are not our secrets to manage"
+paths = [
+  '''(^|/)\.venv/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)__pycache__/''',
+]
+
+# This file contains the patterns it scans for; matching itself is noise.
+[[allowlists]]
+description = "The scanner configuration itself"
+paths = [
+  '''(^|/)\.gitleaks\.toml$''',
+]

@@ -10,7 +10,7 @@
 
 [Unit]
 Description=ChocoFin household ledger Telegram bot
-Documentation=file:/opt/chocofin/docs/DEPLOY.md
+Documentation=file:/opt/chocofin/app/docs/DEPLOY.md
 
 # The database is on a separate LXC, so this needs a routable address before it
 # starts. network.target only means "networking has been configured", which can
@@ -33,7 +33,11 @@ StartLimitIntervalSec=0
 Type=exec
 User=chocofin
 Group=chocofin
-WorkingDirectory=/opt/chocofin
+# The clone, not the home directory. /opt/chocofin is the chocofin user's home
+# and holds whatever tooling drops there (uv's installer writes .local and
+# .cache); the code lives one level down in app/. `python -m bot` resolves the
+# package from this directory, so it has to be the repository root.
+WorkingDirectory=/opt/chocofin/app
 
 # Mode 0600, owned by chocofin:chocofin. Holds TELEGRAM_BOT_TOKEN and
 # DATABASE_URL -- the two values core/config.py deliberately refuses to hold in
@@ -47,7 +51,15 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 # Unbuffered, so a hard crash cannot swallow the last few log lines.
 Environment=PYTHONUNBUFFERED=1
 
-ExecStart=/opt/chocofin/.venv/bin/python -m bot
+# The ledger does not read $TZ: every stored instant is TIMESTAMPTZ in UTC, and
+# every period boundary resolves in Asia/Manila explicitly (core/periods.py).
+# What this pins is the `asctime` in the log format bot/__main__.py sets up.
+# Leaving it unset makes the journal's clock a property of the LXC image, so a
+# rebuilt or restored container can silently shift every log line by eight
+# hours. Fixed at UTC, a journal line and a row in `entries` are the same clock.
+Environment=TZ=UTC
+
+ExecStart=/opt/chocofin/app/.venv/bin/python -m bot
 
 Restart=on-failure
 RestartSec=10s
@@ -76,6 +88,13 @@ SyslogIdentifier=chocofin-bot
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
+# ProtectHome only covers /home, /root and /run/user, so it does not touch this
+# service's home at /opt/chocofin -- ProtectSystem=strict is what makes that
+# read-only, home directory and clone alike. There is deliberately no
+# ReadWritePaths: the process writes nothing to disk (PYTHONDONTWRITEBYTECODE
+# above, dumps go to /var/backups/chocofin from cron, not from here), so every
+# path it can see should stay read-only. Adding one back is a decision to
+# justify, not a default.
 ProtectHome=yes
 
 # No listening socket means no port to bind, which means no capability to keep.

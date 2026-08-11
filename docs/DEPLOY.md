@@ -51,11 +51,16 @@ apt update && apt install -y python3.13 python3.13-venv git postgresql-client cu
 `postgresql-client` is not optional — it is what `pg_dump`, `pg_restore` and
 `psql` come from, and the backup scripts refuse to start without them.
 
-Install `uv` system-wide so the service user does not need a writable home:
+Install `uv` system-wide, on the binary path rather than in a home directory:
 
 ```sh
 curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 ```
+
+`UV_INSTALL_DIR` is the point of that line. Left to itself the installer writes
+into `$HOME` — `.local/` for the binary, `.cache/` for the download — and if it
+is ever run as `chocofin` it does so in `/opt/chocofin`, which is exactly why
+the checkout cannot live there (see below).
 
 The service account. A system user with no login shell and no password: it
 exists to own a process, not to be logged into.
@@ -72,9 +77,20 @@ install -d -o chocofin -g chocofin -m 0750 /etc/chocofin
 install -d -o chocofin -g chocofin -m 0700 /var/backups/chocofin
 ```
 
-`/opt/chocofin` is owned by **root**, not by `chocofin`. The service user reads
-its own code and cannot modify it, so a compromise of the bot process is not
-also a persistence foothold. Deploys and upgrades run as root.
+**`/opt/chocofin` is the service user's home directory, not the checkout.** It
+is where tooling run as `chocofin` deposits its own state — `uv`'s installer
+alone writes `.local/` and `.cache/` there — so it is not reliably empty, and
+`git clone <repo> /opt/chocofin` will fail on it. The code goes in
+`/opt/chocofin/app`, created by the clone step in §3:
+
+```
+/opt/chocofin/          home: .local/, .cache/, whatever else lands here
+/opt/chocofin/app/      the clone: core/, bot/, deploy/, .venv/
+```
+
+Both are owned by **root**, not by `chocofin`. The service user reads its own
+code and cannot modify it, so a compromise of the bot process is not also a
+persistence foothold. Deploys and upgrades run as root.
 
 ---
 
@@ -171,12 +187,17 @@ As root on the bot LXC. Always deploy a tag, never a branch — a rollback needs
 something to roll back *to*.
 
 ```sh
-git clone https://github.com/damienmagdangal/chocofin.git /opt/chocofin
-cd /opt/chocofin
+install -d -o root -g root -m 0755 /opt/chocofin/app
+git clone https://github.com/damienmagdangal/chocofin.git /opt/chocofin/app
+cd /opt/chocofin/app
 git checkout <RELEASE_TAG>
 
 uv sync --frozen --no-dev
 ```
+
+Create `app/` explicitly and clone into it. Do not clone into `/opt/chocofin`
+itself — that is the service user's home (§1), it already contains `.local/` and
+`.cache/`, and `git clone` refuses a non-empty target.
 
 `--frozen` installs exactly what `uv.lock` pins and fails rather than silently
 resolving something new. `--no-dev` leaves pytest and ruff off the production
@@ -187,7 +208,7 @@ write `__pycache__` at runtime. Pre-compile once, at deploy time, so startup
 does not pay to recompile on every boot:
 
 ```sh
-/opt/chocofin/.venv/bin/python -m compileall -q /opt/chocofin/core /opt/chocofin/bot
+/opt/chocofin/app/.venv/bin/python -m compileall -q /opt/chocofin/app/core /opt/chocofin/app/bot
 ```
 
 ---
@@ -271,7 +292,7 @@ Alembic reads `DATABASE_URL` from the environment (`migrations/env.py`);
 Look before you leap:
 
 ```sh
-cd /opt/chocofin
+cd /opt/chocofin/app
 set -a; . /etc/chocofin/chocofin.env; set +a
 uv run alembic current
 uv run alembic history --verbose
@@ -281,7 +302,7 @@ On an existing database, **take a dump first** — this is the point of no retur
 for a rollback that involves schema (see §9):
 
 ```sh
-sudo -u chocofin /opt/chocofin/deploy/backup-chocofin.sh
+sudo -u chocofin /opt/chocofin/app/deploy/backup-chocofin.sh
 ```
 
 Then:
@@ -300,7 +321,7 @@ is append-only. Reconcile by hand with a void and a replacement, then re-run.
 ## 6. Install the service
 
 ```sh
-install -m 0644 /opt/chocofin/deploy/chocofin-bot.service /etc/systemd/system/
+install -m 0644 /opt/chocofin/app/deploy/chocofin-bot.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now chocofin-bot.service
 ```
@@ -365,7 +386,7 @@ assume — the bit is easy to lose through an archive export or a copy from a
 Windows share:
 
 ```sh
-ls -l /opt/chocofin/deploy/*.sh     # expect -rwxr-xr-x
+ls -l /opt/chocofin/app/deploy/*.sh     # expect -rwxr-xr-x
 ```
 
 **Fill in `copy_offsite()`** in `deploy/backup-chocofin.sh`. It ships as a stub
@@ -374,10 +395,17 @@ backup, it is a second copy on the disk that is going to fail. Until you edit
 it, the script writes and verifies a local dump and then fails loudly at that
 step — which is the correct behaviour, not a bug.
 
+Copy all **three** files it is handed: the `.dump`, the `.meta` holding the
+source row counts, and the `.sha256` covering both. A remote dump without its
+`.sha256` cannot be checked for bit rot, and one without its `.meta` cannot be
+restore-tested at all — there is nothing to compare the restored counts against,
+and `restore-test.sh` refuses to run rather than downgrade itself to a weaker
+check.
+
 First run by hand, and read the output:
 
 ```sh
-sudo -u chocofin /opt/chocofin/deploy/backup-chocofin.sh
+sudo -u chocofin /opt/chocofin/app/deploy/backup-chocofin.sh
 echo "exit=$?"
 ```
 
@@ -387,16 +415,32 @@ copy, `7` prune.
 Then prove it restores:
 
 ```sh
-sudo -u chocofin /opt/chocofin/deploy/restore-test.sh
+sudo -u chocofin /opt/chocofin/app/deploy/restore-test.sh
 echo "exit=$?"
 ```
 
-This restores the newest dump into a scratch database, counts `entries` and
-`accounts`, checks that all three DEFERRABLE constraint triggers survived, and
-verifies on the restored rows that every entry has legs and every transfer sums
-to zero — then drops the scratch database from an `EXIT` trap, on every path.
-**Zero rows is a failure, not a pass**; a backup that restores into an empty
-database succeeds at every mechanical step and is worthless.
+This restores the newest dump into a scratch database, checks that all three
+DEFERRABLE constraint triggers survived, and verifies on the restored rows that
+every entry has legs and every transfer sums to zero — then drops the scratch
+database from an `EXIT` trap, on every path.
+
+The row counts are checked **against what the source database actually held**,
+not against a threshold. `backup-chocofin.sh` counts `entries`, `entry_legs` and
+`accounts` just before it dumps and writes them to a `.meta` sidecar next to the
+dump; the restore test reads that file and fails if fewer rows came back. A
+plain "zero rows is a failure" rule would be wrong in both directions — it would
+fail this very run on a fresh deployment, where an empty database is correct
+until the first expense is typed into the bot, and it would happily pass a dump
+of 400 entries that restored as 12.
+
+So **an empty result here is a pass on a new deployment** and the script says so
+in its output. On an established household it means the source was empty when
+the dump was taken, which is worth investigating immediately.
+
+The comparison is `restored >= recorded`, because the counts are taken just
+before `pg_dump` opens its snapshot and nothing is ever deleted from those three
+tables — a dump can legitimately contain a row typed while it ran, but never
+fewer than were there when it started.
 
 ### Schedule
 
@@ -405,8 +449,8 @@ crontab -u chocofin -e
 ```
 
 ```cron
-15 3 * * *   /opt/chocofin/deploy/backup-chocofin.sh
-20 4 1 * *   /opt/chocofin/deploy/restore-test.sh
+15 3 * * *   /opt/chocofin/app/deploy/backup-chocofin.sh
+20 4 1 * *   /opt/chocofin/app/deploy/restore-test.sh
 ```
 
 No `MAILTO`. This LXC has no MTA, so cron's stderr mail goes nowhere. Both
@@ -442,11 +486,11 @@ becomes a bad week.
 The safe, common case.
 
 ```sh
-cd /opt/chocofin
+cd /opt/chocofin/app
 git fetch --tags
 git checkout <PREVIOUS_TAG>
 uv sync --frozen --no-dev
-/opt/chocofin/.venv/bin/python -m compileall -q /opt/chocofin/core /opt/chocofin/bot
+/opt/chocofin/app/.venv/bin/python -m compileall -q /opt/chocofin/app/core /opt/chocofin/app/bot
 systemctl restart chocofin-bot.service
 ```
 

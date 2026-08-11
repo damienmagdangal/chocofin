@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
 # ChocoFin restore test -- the script that turns a backup from a theory into a
-# fact. Restores the newest dump into a scratch database, counts rows in
-# `entries` and `accounts`, checks the schema arrived intact, and drops it.
+# fact. Restores the newest dump into a scratch database, compares its row
+# counts against the ones backup-chocofin.sh recorded in the .meta sidecar at
+# dump time, checks the schema arrived intact, and drops it.
 #
 # Run it by hand after any change to backup-chocofin.sh, and on a schedule --
 # monthly is enough, and cheap:
@@ -10,7 +11,7 @@
 #     20 4 1 * *  /opt/chocofin/deploy/restore-test.sh
 #
 # An untested backup is a guess. The failure this catches is not "the file is
-# missing" -- it is "the file restores into an empty database and nobody looked".
+# missing" -- it is "the file restored, but not all of it, and nobody looked".
 #
 # Shares /etc/chocofin/backup.env with the backup script. No credential,
 # hostname or IP in this file. See docs/DEPLOY.md.
@@ -69,7 +70,7 @@ export PGHOST PGPORT PGUSER PGPASSFILE
 
 # --- preflight -------------------------------------------------------------
 
-for binary in pg_restore psql createdb sha256sum find; do
+for binary in pg_restore psql createdb sha256sum find sed; do
     command -v "$binary" >/dev/null 2>&1 \
         || die $EX_PREFLIGHT "required command '${binary}' is not on PATH"
 done
@@ -85,9 +86,23 @@ DUMP="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'chocofin-*.dump' -printf '
 
 info "testing newest dump: ${DUMP} ($(du -h -- "$DUMP" | cut -f1), modified $(date -Is -r "$DUMP"))"
 
+META="${DUMP}.meta"
+
+# Written by backup-chocofin.sh at dump time; it holds the row counts the
+# assertions below are judged against. Without it this script can only check
+# that the restore mechanically succeeded, which is the weaker test it used to
+# be -- so treat its absence exactly like a missing checksum and stop.
+[[ -f "$META" ]] \
+    || die $EX_CHECKSUM "no metadata sidecar at ${META} -- cannot tell how many rows this dump is supposed to contain"
+
 # --- checksum --------------------------------------------------------------
 # Catches bit rot on the backup volume, which is silent by definition and is a
 # real failure mode for a dump that sits untouched for weeks.
+#
+# The sidecar lists the dump AND the .meta, so this one check covers both. That
+# matters: the counts in the .meta are what every assertion below is measured
+# against, and a rotted or edited meta would move the goalposts silently. This
+# fails first instead.
 
 if [[ -f "${DUMP}.sha256" ]]; then
     if ! ( cd "$BACKUP_DIR" && sha256sum --check --quiet -- "$(basename "${DUMP}.sha256")" ); then
@@ -160,19 +175,56 @@ count_rows() {
     psql_scratch --command="SELECT count(*) FROM ${1};" | tr -d '[:space:]'
 }
 
+# The row counts recorded at dump time. Anything that is not a bare integer is
+# fatal rather than defaulted: a missing key comes back as the empty string,
+# compares as 0, and makes every assertion below trivially true -- which is the
+# silent pass this script exists to prevent.
+#
+# Read in the main shell, not from a function called in `$( )`, so that `die`
+# ends the script rather than just the subshell it was called in.
+declare -A SRC_ROWS=()
+for key in rows_entries rows_entry_legs rows_accounts; do
+    # The trailing `q` stops at the first match, so a duplicated key cannot
+    # silently concatenate two values into something that is not a number.
+    meta_value="$(sed -n "/^${key}=/{s///;p;q;}" -- "$META")"
+    [[ "$meta_value" =~ ^[0-9]+$ ]] \
+        || die $EX_ASSERT "metadata key '${key}' in ${META} is '${meta_value}', not a number -- the recorded counts are unusable, so this dump cannot be verified"
+    SRC_ROWS[$key]="$meta_value"
+done
+
+src_entries="${SRC_ROWS[rows_entries]}"
+src_legs="${SRC_ROWS[rows_entry_legs]}"
+src_accounts="${SRC_ROWS[rows_accounts]}"
+
 entries_count="$(count_rows entries)"
 accounts_count="$(count_rows accounts)"
 legs_count="$(count_rows entry_legs)"
 
-info "row counts -- entries=${entries_count} accounts=${accounts_count} entry_legs=${legs_count}"
+info "row counts -- entries=${entries_count}/${src_entries} accounts=${accounts_count}/${src_accounts} entry_legs=${legs_count}/${src_legs} (restored/recorded at dump time)"
 
-# Zero rows is a failure, not a pass. A dump that restores into an empty
-# database succeeds at every step above and is worthless; that is precisely the
-# silent failure this script is for.
-(( entries_count > 0 )) \
-    || die $EX_ASSERT "restored database has ZERO rows in entries -- the backup is empty"
-(( accounts_count > 0 )) \
-    || die $EX_ASSERT "restored database has ZERO rows in accounts -- the backup is empty"
+# Compare against what the source actually held, not against a threshold.
+#
+# A `> 0` check is wrong at both ends. It fails the first restore test of a new
+# deployment, where the database is empty by design until someone types the
+# first expense into the bot -- and that run is the one gating the deploy. It
+# also passes a dump of 400 entries that restored as 12, which is the exact
+# disaster worth catching.
+#
+# `>=` rather than `==` because backup-chocofin.sh takes these counts just
+# before pg_dump opens its snapshot, and nothing ever deletes from these three
+# tables (entries are append-only; a correction voids and inserts). So the dump
+# can legitimately hold a row or two more than was recorded -- an expense typed
+# while the dump ran -- but it can never hold fewer.
+if (( src_entries == 0 && src_legs == 0 && src_accounts == 0 )); then
+    info "note: the source database held no entries, legs or accounts when this dump was taken, so the checks below confirm an empty ledger round-tripped -- expected on a new deployment, worth investigating on an established one"
+fi
+
+(( entries_count >= src_entries )) \
+    || die $EX_ASSERT "restored entries (${entries_count}) is fewer than the ${src_entries} recorded at dump time -- rows were lost in the round trip"
+(( accounts_count >= src_accounts )) \
+    || die $EX_ASSERT "restored accounts (${accounts_count}) is fewer than the ${src_accounts} recorded at dump time -- rows were lost in the round trip"
+(( legs_count >= src_legs )) \
+    || die $EX_ASSERT "restored entry_legs (${legs_count}) is fewer than the ${src_legs} recorded at dump time -- rows were lost in the round trip"
 (( legs_count >= entries_count )) \
     || die $EX_ASSERT "entry_legs (${legs_count}) < entries (${entries_count}) -- every entry must have at least one leg, so legs were lost"
 

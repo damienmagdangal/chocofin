@@ -113,6 +113,7 @@ umask 077
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 FINAL="${BACKUP_DIR}/chocofin-${STAMP}.dump"
+META="${FINAL}.meta"
 TMP_DUMP="$(mktemp "${BACKUP_DIR}/.in-progress.XXXXXXXX")"
 TOC_FILE="${TMP_DUMP}.toc"
 
@@ -122,6 +123,44 @@ cleanup() { rm -f -- "$TMP_DUMP" "$TOC_FILE"; }
 trap cleanup EXIT
 
 info "starting backup of database '${PGDATABASE}' -> ${FINAL}"
+
+# --- source row counts -----------------------------------------------------
+# Recorded so restore-test.sh can compare what came back against what was here,
+# rather than against a hardcoded threshold. A `> 0` check is wrong in both
+# directions: it fails the very first restore test on a fresh deploy, where an
+# empty database is correct and expected, and it passes a dump of 400 entries
+# that restores as 12.
+#
+# Taken BEFORE pg_dump opens its snapshot, and this ordering is the whole basis
+# of the comparison. `entries` and `entry_legs` are append-only -- a correction
+# voids and inserts, it never UPDATEs or DELETEs -- and nothing removes an
+# account. So the snapshot pg_dump takes a moment from now can only hold MORE
+# rows than these numbers, never fewer, which is why restore-test.sh asserts
+# `restored >= recorded`.
+#
+# Counting after the dump instead would invert that: an expense typed into the
+# bot at 03:16 would put the count above the dump and fail a restore test on a
+# backup that is perfectly good.
+
+count_source_rows() {
+    psql --no-psqlrc --tuples-only --no-align --quiet --set=ON_ERROR_STOP=1 \
+         --dbname="$PGDATABASE" --command="SELECT count(*) FROM ${1};" \
+        | tr -d '[:space:]'
+}
+
+declare -A SRC_ROWS=()
+for table in entries entry_legs accounts; do
+    if ! count="$(count_source_rows "$table")"; then
+        die $EX_DUMP "could not count rows in '${table}' -- refusing to write a dump whose contents cannot be verified later"
+    fi
+    # An empty string from a psql that failed quietly would be recorded, then
+    # read back as 0, and would make every later comparison trivially true.
+    [[ "$count" =~ ^[0-9]+$ ]] \
+        || die $EX_DUMP "row count for '${table}' was '${count}', not a number -- refusing to record it"
+    SRC_ROWS[$table]="$count"
+done
+
+info "source row counts -- entries=${SRC_ROWS[entries]} entry_legs=${SRC_ROWS[entry_legs]} accounts=${SRC_ROWS[accounts]}"
 
 # --- dump ------------------------------------------------------------------
 # Custom format because it is what pg_restore needs for selective restore, and
@@ -161,7 +200,27 @@ done
 # and verified, so a crash mid-dump cannot leave something that looks restorable.
 mv -- "$TMP_DUMP" "$FINAL"
 
-( cd "$BACKUP_DIR" && sha256sum -- "$(basename "$FINAL")" > "$(basename "$FINAL").sha256" ) \
+# The counts travel with the dump. Plain key=value so restore-test.sh can read
+# it with sed and a human can read it with cat; the dump's own name is in here
+# too, so a meta file that got separated from its dump is obvious rather than
+# silently applied to the wrong one.
+{
+    printf 'dump=%s\n'            "$(basename "$FINAL")"
+    printf 'taken_at=%s\n'        "$STAMP"
+    printf 'database=%s\n'        "$PGDATABASE"
+    printf 'rows_entries=%s\n'    "${SRC_ROWS[entries]}"
+    printf 'rows_entry_legs=%s\n' "${SRC_ROWS[entry_legs]}"
+    printf 'rows_accounts=%s\n'   "${SRC_ROWS[accounts]}"
+} > "$META" || die $EX_VERIFY "failed to write metadata sidecar ${META}"
+
+# Both files in the one sidecar, on purpose. The counts are what the restore
+# test is judged against, so they need the same bit-rot and truncation
+# protection as the dump itself -- and this way restore-test.sh's existing
+# `sha256sum --check` covers the pair with no extra machinery. A meta file that
+# rotted, was edited, or arrived truncated off-box fails there, before any
+# comparison is made against numbers that can no longer be trusted.
+( cd "$BACKUP_DIR" \
+    && sha256sum -- "$(basename "$FINAL")" "$(basename "$META")" > "$(basename "$FINAL").sha256" ) \
     || die $EX_VERIFY "failed to write checksum sidecar for ${FINAL}"
 
 info "dump verified: $(du -h -- "$FINAL" | cut -f1) at ${FINAL}"
@@ -169,7 +228,7 @@ info "dump verified: $(du -h -- "$FINAL" | cut -f1) at ${FINAL}"
 # --- off-box copy ----------------------------------------------------------
 
 copy_offsite() {
-    local dump=$1 sidecar=$2
+    local dump=$1 meta=$2 sidecar=$3
 
     # -----------------------------------------------------------------------
     # FILL THIS IN.
@@ -178,18 +237,21 @@ copy_offsite() {
     #   * it must exit non-zero on failure -- no `|| true`, no `&`
     #   * host, user, key and remote path come from ${CONFIG_FILE}, never from
     #     this file
-    #   * copy the .sha256 sidecar too, or the remote copy cannot be checked
+    #   * copy all THREE files. Without the .sha256 the remote copy cannot be
+    #     checked; without the .meta it cannot be restore-tested, because there
+    #     is nothing to compare the restored row counts against.
     #
     # rsync over SSH:
     #
     #   rsync --archive --chmod=F600 \
     #         -e "ssh -i ${OFFSITE_SSH_KEY} -o BatchMode=yes -o StrictHostKeyChecking=yes" \
-    #         -- "$dump" "$sidecar" "${OFFSITE_DEST}/" \
+    #         -- "$dump" "$meta" "$sidecar" "${OFFSITE_DEST}/" \
     #     || return 1
     #
     # rclone to object storage:
     #
     #   rclone copy --config "${RCLONE_CONFIG}" -- "$dump"    "${OFFSITE_DEST}" || return 1
+    #   rclone copy --config "${RCLONE_CONFIG}" -- "$meta"    "${OFFSITE_DEST}" || return 1
     #   rclone copy --config "${RCLONE_CONFIG}" -- "$sidecar" "${OFFSITE_DEST}" || return 1
     #
     # Whichever you use, verify the bytes arrived rather than trusting exit 0 --
@@ -201,7 +263,7 @@ copy_offsite() {
     die $EX_OFFSITE "copy_offsite() is still the stub shipped with the repo -- edit deploy/backup-chocofin.sh and configure OFFSITE_DEST (see docs/DEPLOY.md). The local dump at ${dump} IS complete and verified; it just has not left the box, so it does not yet count as a backup."
 }
 
-copy_offsite "$FINAL" "${FINAL}.sha256"
+copy_offsite "$FINAL" "$META" "${FINAL}.sha256"
 info "off-box copy complete"
 
 # --- prune -----------------------------------------------------------------
@@ -219,10 +281,12 @@ prune() {
     fi
 
     # -mtime +N cannot match the file created moments ago, and the name guard
-    # makes that explicit rather than relying on it.
+    # makes that explicit rather than relying on it. The .meta and .sha256 ages
+    # out with the dump it describes; keeping either behind would leave a
+    # sidecar pointing at a file that is gone.
     find "$BACKUP_DIR" -maxdepth 1 -type f \
-        \( -name 'chocofin-*.dump' -o -name 'chocofin-*.dump.sha256' \) \
-        ! -name "${newest_name}" ! -name "${newest_name}.sha256" \
+        \( -name 'chocofin-*.dump' -o -name 'chocofin-*.dump.sha256' -o -name 'chocofin-*.dump.meta' \) \
+        ! -name "${newest_name}" ! -name "${newest_name}.sha256" ! -name "${newest_name}.meta" \
         -mtime "+${RETENTION_DAYS}" \
         -print -delete
 }
