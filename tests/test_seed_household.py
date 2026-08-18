@@ -5,6 +5,12 @@ nothing inside the bot can write it, so if this is wrong the household is
 either unreachable (no member) or duplicated (two households, two ledgers, and
 the money split between them with nothing to show for it).
 
+It is also the only chance to get an opening balance right. Balances are
+derived — `opening_balance_minor + SUM(legs)` — and `entries` is append-only,
+so an account seeded at zero that was never at zero cannot be corrected later
+except by an adjusting entry for money that never moved. Hence the tests below
+that follow a seeded peso amount all the way to `core.balances`.
+
 Two things are deliberately NOT tested here:
 
 * `_main`'s happy path. It calls `make_engine()`, which reads `DATABASE_URL` —
@@ -30,26 +36,47 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core import ledger
+from core import balances, ledger
 from core.config import Settings
 from core.errors import CardHasNoBillingAccountError
 from core.models import Account, Entry, Household, Member
 from scripts import seed_household
-from scripts.seed_household import _main, _parse_account, _redact, seed
+from scripts.seed_household import (
+    AccountSpec,
+    SeedError,
+    _main,
+    _parse_account,
+    _parse_pesos,
+    _redact,
+    seed,
+)
 from tests.factories import JAN_15
 
 # One household, one owner, and a card that settles from the bank. The card is
 # listed BEFORE the account that bills it on purpose: an operator types the
 # accounts in whatever order they think of them, and the card cannot be linked
 # on the pass that creates it because "BPI" does not exist yet.
-SPECS = ["Wallet:cash", "Visa:credit_card:BPI", "BPI:bank"]
+#
+# Every amount is in pesos, as typed on a command line. The centavo values they
+# must become are spelled out beneath so a conversion bug shows up as a wrong
+# constant rather than as two expressions agreeing with each other.
+SPECS = [
+    "Wallet:cash:opening=1500",
+    "Visa:credit_card:opening=-3000:limit=50000:billing=BPI",
+    "BPI:bank:opening=42350.75",
+]
+
+WALLET_OPENING = 150_000  # PHP 1,500.00
+VISA_OPENING = -300_000  # PHP 3,000.00 owed — a liability is a negative balance
+VISA_LIMIT = 5_000_000  # PHP 50,000.00
+BPI_OPENING = 4_235_075  # PHP 42,350.75
 
 HOUSEHOLD = "Seeded Home"
 TELEGRAM_ID = 20_000_001
 DISPLAY_NAME = "Operator"
 
 
-def _specs() -> list[tuple[str, str, str | None]]:
+def _specs() -> list[AccountSpec]:
     """Parse the CLI strings, so the tests below seed what `--account` means."""
     return [_parse_account(spec) for spec in SPECS]
 
@@ -77,6 +104,63 @@ async def _account(session: AsyncSession, name: str) -> Account:
     )
     assert account is not None, f"no account named {name!r}"
     return account
+
+
+# --- pesos to centavos ------------------------------------------------------
+#
+# The single conversion in the script. It happens once, here, so that nothing
+# downstream ever sees a peso — and it is integer arithmetic, because
+# `1234.56 * 100` is 123455.99999999999 and money does not survive that.
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("0", 0),
+        ("1500", 150_000),
+        # The case that makes float wrong. 42350.75 * 100 is not 4235075.0 in
+        # every rounding mode, and this is a real bank balance shape.
+        ("42350.75", 4_235_075),
+        ("1,234.50", 123_450),
+        # A card's debt. Negatives exist here and nowhere else in the money
+        # path: liabilities are negative balances.
+        ("-3000", -300_000),
+        ("-0.01", -1),
+        (".50", 50),
+        ("0.05", 5),
+        # One decimal place means tenths of a peso, not centavos.
+        ("1.5", 150),
+        (" 1500 ", 150_000),
+    ],
+)
+def test_pesos_become_centavos_exactly(text: str, expected: int):
+    assert _parse_pesos(text, field="opening") == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "fragment"),
+    [
+        # Finer than a centavo. Rounding it would invent a value the operator
+        # did not type, in the one column that cannot be corrected later.
+        ("1.234", "finer than one centavo"),
+        ("1.", "truncated"),
+        ("abc", "not an amount in pesos"),
+        ("1 000", "not an amount in pesos"),
+        ("--5", "not an amount in pesos"),
+        ("50%", "not an amount in pesos"),
+        # int("١٠٠") is 100 and str.isdigit() agrees. Accepting it would put a
+        # number nobody typed into a balance.
+        ("١٠٠", "not an amount in pesos"),
+        ("", "no amount"),
+        ("-", "no digits"),
+    ],
+)
+def test_a_bad_peso_amount_is_rejected_rather_than_guessed(text: str, fragment: str):
+    with pytest.raises(argparse.ArgumentTypeError) as excinfo:
+        _parse_pesos(text, field="opening")
+    assert fragment in str(excinfo.value)
+    # The message names the field, so a spec with several amounts says which.
+    assert "opening" in str(excinfo.value)
 
 
 # --- first run --------------------------------------------------------------
@@ -121,6 +205,71 @@ async def test_the_first_run_creates_the_household_member_and_accounts(
     assert sum("created account" in line for line in log) == 3
 
 
+async def test_the_pesos_on_the_command_line_land_as_centavos_in_the_columns(
+    session: AsyncSession,
+):
+    """The whole point of `opening=` and `limit=`.
+
+    Asserted against the constants at the top of this file rather than against
+    an expression, so a conversion that is wrong by a factor of a hundred
+    cannot agree with the test that checks it.
+    """
+    await _seed(session)
+
+    wallet = await _account(session, "Wallet")
+    bank = await _account(session, "BPI")
+    card = await _account(session, "Visa")
+
+    assert wallet.opening_balance_minor == WALLET_OPENING
+    assert bank.opening_balance_minor == BPI_OPENING
+    assert card.opening_balance_minor == VISA_OPENING
+    assert card.credit_limit_minor == VISA_LIMIT
+
+    # A limit belongs to a card and to nothing else: `available_credit_minor`
+    # returns a number for any account that has one.
+    assert wallet.credit_limit_minor is None
+    assert bank.credit_limit_minor is None
+
+
+async def test_a_seeded_account_reports_the_balance_it_was_seeded_with(
+    session: AsyncSession,
+):
+    """Through `core.balances`, which is where the operator will see it.
+
+    A balance is `opening_balance_minor + SUM(legs)` and there are no legs yet,
+    so this is the seed and only the seed. Seeding zero here would not fail
+    anywhere — it would just quietly show the wrong number forever.
+    """
+    await _seed(session)
+
+    bank = await _account(session, "BPI")
+    card = await _account(session, "Visa")
+
+    bank_balance = await balances.account_balance(
+        session, household_id=bank.household_id, account_id=bank.id
+    )
+    assert bank_balance.balance_minor == BPI_OPENING
+
+    card_balance = await balances.account_balance(
+        session, household_id=card.household_id, account_id=card.id
+    )
+    # Money owed, so negative. A card seeded positive would add its debt to net
+    # worth instead of subtracting it.
+    assert card_balance.balance_minor == VISA_OPENING
+
+    # Limit plus balance: PHP 50,000.00 - PHP 3,000.00. Without `limit=` this
+    # is None for the life of the card, which is why the spec insists on it.
+    available = await balances.available_credit(
+        session, household_id=card.household_id, account_id=card.id
+    )
+    assert available == VISA_LIMIT + VISA_OPENING == 4_700_000
+
+    # Net worth adds them up, cash included, with the debt pulling it down.
+    assert await balances.net_worth_minor(session, household_id=card.household_id) == (
+        WALLET_OPENING + BPI_OPENING + VISA_OPENING
+    )
+
+
 # --- re-runs ----------------------------------------------------------------
 
 
@@ -144,6 +293,8 @@ async def test_a_second_identical_run_is_a_no_op_not_a_duplicate(
     assert any("already exists" in line and DISPLAY_NAME in line for line in log)
     assert sum("already exists" in line for line in log) == 4  # member + 3 accounts
     assert not any("created" in line for line in log)
+    # Identical means identical: no drift to report.
+    assert not any("left alone" in line for line in log)
 
 
 async def test_a_rerun_in_different_case_is_still_the_same_account(
@@ -158,6 +309,10 @@ async def test_a_rerun_in_different_case_is_still_the_same_account(
 
     assert await _count(session, Account) == 3
     assert any("already exists" in line for line in log)
+    # No `opening=` was typed, so there is no disagreement about money to
+    # report — only a stated amount that differs is worth a line.
+    assert not any("left alone" in line for line in log)
+    assert (await _account(session, "BPI")).opening_balance_minor == BPI_OPENING
 
 
 async def test_a_rerun_never_moves_a_known_telegram_id_to_another_household(
@@ -178,6 +333,125 @@ async def test_a_rerun_never_moves_a_known_telegram_id_to_another_household(
     assert any("already exists" in line for line in log)
 
 
+async def test_a_rerun_reports_a_different_opening_balance_instead_of_writing_it(
+    session: AsyncSession,
+):
+    """The rule the billing link already follows, on the two money columns.
+
+    An opening balance is history: every balance the household has ever seen
+    was derived from it, and `entries` is append-only, so silently rewriting it
+    moves all of them at once with nothing in the ledger to explain the jump. A
+    credit limit is the same answer for a smaller reason — the operator is told
+    what is there and decides.
+    """
+    await _seed(session)
+
+    log = await _seed(
+        session,
+        account_specs=[
+            _parse_account("Wallet:cash:opening=9999"),
+            _parse_account("Visa:credit_card:opening=-4500:limit=80000:billing=BPI"),
+        ],
+    )
+
+    assert (await _account(session, "Wallet")).opening_balance_minor == WALLET_OPENING
+    card = await _account(session, "Visa")
+    assert card.opening_balance_minor == VISA_OPENING
+    assert card.credit_limit_minor == VISA_LIMIT
+
+    # In pesos, because that is what the operator typed and can act on.
+    assert any(
+        line == "'Wallet' opening balance is ₱1,500.00, not ₱9,999.00 — left alone"
+        for line in log
+    )
+    assert any(
+        line == "'Visa' opening balance is -₱3,000.00, not -₱4,500.00 — left alone"
+        for line in log
+    )
+    assert any(
+        line == "'Visa' credit limit is ₱50,000.00, not ₱80,000.00 — left alone"
+        for line in log
+    )
+
+
+# --- rejected before anything is written ------------------------------------
+
+
+async def test_a_billing_account_that_names_nothing_aborts_the_whole_run(
+    session: AsyncSession,
+):
+    """A typo in `billing=` must not leave a card behind.
+
+    Creating the card anyway and reporting the failed link in a log line is
+    exactly the half-usable account this script must not produce: `/pay` raises
+    `CardHasNoBillingAccountError` on it, and by then nobody remembers a line
+    from the seed. It is one mistyped argument, so it costs the run.
+    """
+    with pytest.raises(SeedError) as excinfo:
+        await seed(
+            session,
+            household_name=HOUSEHOLD,
+            telegram_user_id=TELEGRAM_ID,
+            display_name=DISPLAY_NAME,
+            account_specs=[
+                _parse_account("BPI:bank:opening=1000"),
+                _parse_account("Visa:credit_card:limit=50000:billing=BDO"),
+            ],
+        )
+    assert "'BDO'" in str(excinfo.value)
+    await session.rollback()
+
+    # Not just the card: the household and the member go too. `session_scope`
+    # rolls the transaction back in production for the same reason.
+    assert await _count(session, Account) == 0
+    assert await _count(session, Household) == 0
+    assert await _count(session, Member) == 0
+
+
+async def test_a_billing_account_already_in_the_household_is_enough(
+    session: AsyncSession,
+):
+    """The other half: `billing=` may name a row from an earlier run.
+
+    Adding a card months later is the normal way this script gets used a second
+    time, and the bank it settles from is not on that command line.
+    """
+    await _seed(session, account_specs=[_parse_account("BPI:bank:opening=1000")])
+
+    await _seed(
+        session,
+        account_specs=[_parse_account("Amex:credit_card:limit=20000:billing=BPI")],
+    )
+
+    card = await _account(session, "Amex")
+    assert card.billing_account_id == (await _account(session, "BPI")).id
+
+
+async def test_two_specs_claiming_one_name_abort_before_the_first_insert(
+    session: AsyncSession,
+):
+    """`uq_accounts_household_name_lower` would catch this on the second
+    INSERT — after the household, the member and one account were written, with
+    a Postgres error naming an index rather than the two arguments that
+    disagree. Names are case-insensitive, so 'wallet' and 'Wallet' are one."""
+    with pytest.raises(SeedError) as excinfo:
+        await seed(
+            session,
+            household_name=HOUSEHOLD,
+            telegram_user_id=TELEGRAM_ID,
+            display_name=DISPLAY_NAME,
+            account_specs=[
+                _parse_account("Wallet:cash:opening=100"),
+                _parse_account("wallet:ewallet:opening=200"),
+            ],
+        )
+    assert "case-insensitive" in str(excinfo.value)
+    await session.rollback()
+
+    assert await _count(session, Household) == 0
+    assert await _count(session, Account) == 0
+
+
 # --- malformed specs --------------------------------------------------------
 
 
@@ -187,8 +461,6 @@ async def test_a_rerun_never_moves_a_known_telegram_id_to_another_household(
         # Not enough colons: the whole shape is wrong, so say the shape.
         ("Wallet", "NAME:TYPE"),
         ("", "NAME:TYPE"),
-        # Too many: a name containing a colon is a typo, not a fourth field.
-        ("Visa:credit_card:BPI:extra", "NAME:TYPE"),
         # An empty name would create an account nobody can pick off a keyboard.
         (":cash", "empty account name"),
         ("  :cash", "empty account name"),
@@ -196,9 +468,31 @@ async def test_a_rerun_never_moves_a_known_telegram_id_to_another_household(
         # Postgres error; reject it here where the message can list the options.
         ("Wallet:crypto", "'crypto' is not one of"),
         ("Wallet:crypto", "cash, bank, ewallet, credit_card, savings, loan"),
-        # Only a card has a billing account. Silently ignoring the third field
-        # would leave the operator sure they had linked something.
-        ("BPI:bank:Wallet", "cannot have a billing account"),
+        # The old spec was NAME:TYPE:BILLING. Anyone with that command in their
+        # shell history lands here, so the message has to name the new form.
+        ("Visa:credit_card:BPI", "did you mean billing=BPI?"),
+        ("Visa:credit_card:limit=1:billing=BPI:extra", "is not key=value"),
+        ("Wallet:cash:opening", "did you mean billing=opening?"),
+        # A typo in a key must not be read as "no opinion about that field".
+        ("Wallet:cash:openning=100", "'openning' in"),
+        ("Wallet:cash:openning=100", "one of opening, limit, billing"),
+        ("Wallet:cash:opening=1:opening=2", "gives opening= twice"),
+        # A card with no limit can never report available credit, and a card
+        # with no billing account fails every /pay. Both are half an account.
+        ("Visa:credit_card:opening=-3000", "needs limit=<pesos>"),
+        ("Visa:credit_card:limit=50000", "needs billing=<account name>"),
+        ("Visa:credit_card:limit=50000", "CardHasNoBillingAccountError"),
+        # Only a card has either. Silently ignoring them would leave the
+        # operator sure they had set something.
+        ("BPI:bank:billing=Wallet", "cannot have a billing account"),
+        ("BPI:bank:limit=50000", "cannot have a credit limit"),
+        # ck_accounts_credit_limit_non_negative, said where it can be read.
+        ("Visa:credit_card:limit=-5:billing=BPI", "negative credit limit"),
+        # ck_accounts_not_self_billing. A card settling from itself would make
+        # /pay a transfer between one account and itself.
+        ("Visa:credit_card:limit=5:billing=visa", "cannot settle from itself"),
+        # The amount errors reach the top through the same path.
+        ("Wallet:cash:opening=1.234", "finer than one centavo"),
     ],
 )
 def test_a_malformed_account_spec_is_rejected_with_a_usable_error(
@@ -209,9 +503,32 @@ def test_a_malformed_account_spec_is_rejected_with_a_usable_error(
     assert fragment in str(excinfo.value)
 
 
-def test_a_well_formed_spec_survives_whitespace_and_an_absent_billing_account():
-    assert _parse_account(" Wallet : cash ") == ("Wallet", "cash", None)
-    assert _parse_account("Visa:credit_card:BPI") == ("Visa", "credit_card", "BPI")
+def test_a_well_formed_spec_survives_whitespace_and_an_absent_amount():
+    """An omitted `opening=` is None, not zero.
+
+    The distinction is what lets a re-run tell "the operator says this account
+    holds nothing" apart from "the operator did not mention it", so an omission
+    never produces a line claiming a disagreement about money.
+    """
+    assert _parse_account(" Wallet : cash ") == AccountSpec(
+        name="Wallet",
+        type="cash",
+        opening_balance_minor=None,
+        credit_limit_minor=None,
+        billing_account_name=None,
+    )
+    assert _parse_account("Wallet:cash:opening=0") == AccountSpec(
+        name="Wallet", type="cash", opening_balance_minor=0
+    )
+    assert _parse_account(
+        "Visa : credit_card : opening=-3000 : limit=50,000 : billing=BPI "
+    ) == AccountSpec(
+        name="Visa",
+        type="credit_card",
+        opening_balance_minor=-300_000,
+        credit_limit_minor=5_000_000,
+        billing_account_name="BPI",
+    )
 
 
 async def test_the_cli_rejects_a_malformed_account_spec_before_touching_the_db(
@@ -230,18 +547,7 @@ async def test_the_cli_rejects_a_malformed_account_spec_before_touching_the_db(
     that into a `_Reached` and a red test instead of a connection to production.
     """
     with pytest.raises(SystemExit) as excinfo:
-        await _main(
-            [
-                "--household",
-                HOUSEHOLD,
-                "--telegram-user-id",
-                str(TELEGRAM_ID),
-                "--display-name",
-                DISPLAY_NAME,
-                "--account",
-                "Wallet:crypto",
-            ]
-        )
+        await _main(_argv("--account", "Wallet:crypto"))
     assert excinfo.value.code == 2
 
     stderr = capsys.readouterr().err
@@ -249,11 +555,29 @@ async def test_the_cli_rejects_a_malformed_account_spec_before_touching_the_db(
     assert "'crypto' is not one of" in stderr
 
 
+async def test_the_cli_rejects_a_card_with_no_credit_limit_before_touching_the_db(
+    guarded, capsys: pytest.CaptureFixture[str]
+):
+    """The new half of the same guarantee.
+
+    A card missing `limit=` is not a malformed string — it parses fine and
+    would have inserted cleanly. It is refused because the account it would
+    create can never report available credit, and refused early enough that no
+    engine is built to insert it with.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        await _main(_argv("--account", "Visa:credit_card:billing=BPI"))
+    assert excinfo.value.code == 2
+
+    stderr = capsys.readouterr().err
+    assert "needs limit=<pesos>" in stderr
+
+
 # --- the billing link -------------------------------------------------------
 
 
 async def test_a_seeded_card_settles_from_its_billing_account(session: AsyncSession):
-    """The point of the whole `--account NAME:TYPE:BILLING` third field.
+    """The point of the whole `billing=` field.
 
     `settle_card` resolves the paying account from `billing_account_id` and
     raises rather than guessing, so a seed that wrote the column as NULL — or
@@ -308,6 +632,19 @@ async def test_a_seeded_card_settles_from_its_billing_account(session: AsyncSess
         == 0
     )
 
+    # The settlement moved real money, so both derived balances move with it —
+    # off the bank, and against the debt on the card.
+    assert (
+        await balances.account_balance(
+            session, household_id=card.household_id, account_id=bank.id
+        )
+    ).balance_minor == BPI_OPENING - 250_000
+    assert (
+        await balances.account_balance(
+            session, household_id=card.household_id, account_id=card.id
+        )
+    ).balance_minor == VISA_OPENING + 250_000
+
 
 async def test_a_rerun_never_repoints_a_card_that_already_has_a_billing_account(
     session: AsyncSession,
@@ -315,17 +652,18 @@ async def test_a_rerun_never_repoints_a_card_that_already_has_a_billing_account(
     """The same "leave what is there alone" rule the accounts and the member
     follow, on the one column that decides where money comes from.
 
-    A card linked to BPI, re-run as `Visa:credit_card:Wallet`, used to be
-    repointed in silence and logged with the line that means "linked" — so the
-    next `/pay` would have moved real money out of Wallet, and the log the
-    operator read would have looked like the first run's. It keeps BPI, and the
-    difference is reported.
+    A card linked to BPI, re-run as `billing=Wallet`, used to be repointed in
+    silence and logged with the line that means "linked" — so the next `/pay`
+    would have moved real money out of Wallet, and the log the operator read
+    would have looked like the first run's. It keeps BPI, and the difference is
+    reported.
     """
     await _seed(session)
     bank = await _account(session, "BPI")
 
     log = await _seed(
-        session, account_specs=[_parse_account("Visa:credit_card:Wallet")]
+        session,
+        account_specs=[_parse_account("Visa:credit_card:limit=50000:billing=Wallet")],
     )
 
     card = await _account(session, "Visa")
@@ -335,15 +673,22 @@ async def test_a_rerun_never_repoints_a_card_that_already_has_a_billing_account(
     assert not any(line == "'Visa' settles from 'Wallet'" for line in log)
 
 
-async def test_an_unlinked_seeded_card_refuses_to_invent_a_payer(
+async def test_a_card_with_no_billing_account_refuses_to_invent_a_payer(
     session: AsyncSession,
 ):
-    """The rejection half. A two-field spec leaves `billing_account_id` NULL,
-    and `settle_card` raises instead of picking an account — inventing where
-    the money came from is a lie about real money."""
+    """Why the spec insists on `billing=`, demonstrated rather than asserted.
+
+    `--account Visa:credit_card:limit=50000` cannot produce this row any more —
+    it exits 2 — so the spec is built by hand to show what the rejection is
+    protecting the operator from: a card that exists, looks fine in every
+    listing, and fails every single `/pay`.
+    """
     await _seed(
         session,
-        account_specs=[_parse_account("BPI:bank"), _parse_account("Visa:credit_card")],
+        account_specs=[
+            _parse_account("BPI:bank:opening=1000"),
+            AccountSpec(name="Visa", type="credit_card", credit_limit_minor=VISA_LIMIT),
+        ],
     )
     card = await _account(session, "Visa")
     member = await session.scalar(select(Member))
@@ -445,19 +790,36 @@ async def test_the_target_and_what_it_will_write_are_printed_before_the_prompt(
     """The operator has to be able to see they are aimed at the wrong database.
 
     The Telegram id is the line that matters most — it is the value `seed`
-    short-circuits on, and the one that is awkward to reverse.
+    short-circuits on, and the one that is awkward to reverse. The amounts are
+    next: a limit typed into `opening=` is not something anyone spots in
+    centavos, and it is a wrong balance for the life of the household.
     """
     monkeypatch.setattr(seed_household, "_interactive", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _prompt: "")
 
-    assert await _main(_argv("--account", "Wallet:cash")) == 1
+    assert (
+        await _main(
+            _argv(
+                "--account",
+                "Wallet:cash:opening=1500",
+                "--account",
+                "Visa:credit_card:opening=-3000:limit=50000:billing=BPI",
+            )
+        )
+        == 1
+    )
 
     out = capsys.readouterr().out
     assert "postgresql+asyncpg://chocofin@db.invalid:5432/chocofin" in out
     assert "database: chocofin" in out
     assert str(TELEGRAM_ID) in out
     assert HOUSEHOLD in out
-    assert "'Wallet' (cash)" in out
+    # In pesos, the way they were typed — not the centavos they become.
+    assert "'Wallet' (cash), opening ₱1,500.00" in out
+    assert (
+        "'Visa' (credit_card), opening -₱3,000.00, limit ₱50,000.00, "
+        "settles from 'BPI'" in out
+    )
     # No secrets on stdout, ever.
     assert FAKE_PASSWORD not in out
 

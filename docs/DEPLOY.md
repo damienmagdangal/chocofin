@@ -28,6 +28,7 @@ value is one of these, and you substitute it here:
 | `<DB_PASSWORD>` | password for the `chocofin` Postgres role |
 | `<BACKUP_DB_PASSWORD>` | password for the `chocofin_backup` role |
 | `<BOT_TOKEN>` | Telegram bot token from BotFather |
+| `<TELEGRAM_USER_ID>` | numeric Telegram user id of the household owner |
 | `<OFFSITE_DEST>` | rsync/rclone target for off-box backup copies |
 | `<RELEASE_TAG>` | the git tag being deployed, e.g. `v0.1.0` |
 
@@ -125,21 +126,123 @@ rights beyond this section.
 
 ### Lock down access
 
+The database-level statements, from the `postgres` session you are already in:
+
 ```sql
 REVOKE CONNECT ON DATABASE chocofin FROM PUBLIC;
 GRANT  CONNECT ON DATABASE chocofin TO chocofin;
-
-\c chocofin
-REVOKE ALL ON SCHEMA public FROM PUBLIC;
-GRANT  ALL ON SCHEMA public TO chocofin;
+ALTER  DATABASE chocofin OWNER TO chocofin;
 ```
 
 `PUBLIC` is every role that exists now and every role created later. Without the
 first `REVOKE`, a role added years from now for some unrelated service can
 connect to the household ledger on the day it is created, because `CONNECT` is
-granted to `PUBLIC` by default. Postgres 15+ already removes `CREATE` on schema
-`public` from `PUBLIC`; the `REVOKE ALL` above is explicit about it so this does
-not silently depend on the server version.
+granted to `PUBLIC` by default.
+
+Then the schema, in a **separate** `psql` aimed at the target database:
+
+```sh
+sudo -u postgres psql -v ON_ERROR_STOP=1 --dbname=chocofin <<'SQL'
+ALTER SCHEMA public OWNER TO chocofin;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+SQL
+```
+
+**`--dbname=chocofin` rather than `\c chocofin`, deliberately.** In an
+interactive psql a failed `\c` keeps the previous connection open — you are
+still on the `postgres` maintenance database, the statements after it apply to
+*that* database's `public` schema, and every one of them reports success. Nothing
+surfaces until `alembic upgrade head` in §5 dies with `permission denied for
+schema public` against a database whose setup apparently went fine. A separate
+psql cannot make that mistake: if it cannot reach `chocofin` it exits non-zero
+having run nothing at all. `ON_ERROR_STOP=1` is the other half — without it psql
+carries on after a failed statement and still exits `0`.
+
+**Ownership rather than grants**, because the schema is not finished. `GRANT
+USAGE, CREATE ON SCHEMA public TO chocofin` describes `public` as it is today;
+every table, index and sequence a later migration adds is a new object, and
+anything the role does not create itself needs `ALTER DEFAULT PRIVILEGES` kept in
+sync beside the grant. Making `chocofin` the owner means new objects created by
+future migrations inherit correctly with no further grants — revision `0001` and
+a revision written two years from now both just work. It also removes a layer of
+indirection: Postgres 15+ ships `public` owned by `pg_database_owner` with
+`USAGE` still granted to `PUBLIC`, so the effective owner is whoever owns the
+database. The `ALTER` states it outright and the `REVOKE ALL` takes back that
+residual `USAGE`, neither of which then depends on the server version.
+
+### Verify the lockdown
+
+Both checks run on the db LXC. The first proves the ownership landed on the
+database you meant; the second proves the role cannot reach anything else.
+
+**1. `chocofin` can create in `public`, in the right database.**
+
+```sh
+sudo -u postgres psql -v ON_ERROR_STOP=1 --dbname=chocofin <<'SQL'
+SET ROLE chocofin;
+SELECT current_database() AS db, current_user AS role;
+CREATE TABLE _probe_privileges (id int);
+DROP TABLE _probe_privileges;
+RESET ROLE;
+SQL
+echo "exit=$?"
+```
+
+Expect the row `chocofin | chocofin` and `exit=0`. `SET ROLE` is what makes this
+a real test rather than a superuser doing what superusers can always do:
+privilege checks run as `chocofin` from that point, bypass included, so a
+schema the role cannot create in fails here exactly as Alembic would —
+`ERROR: no schema has been selected to create in`.
+
+This is a privileges test, not a login test. `pg_hba.conf` below admits
+`chocofin` only from `<BOT_LXC_IP>`, so there is no way to log in as it from the
+db LXC; §5's `alembic current` is the first genuine end-to-end connection.
+
+**2. `chocofin` cannot connect to any other database on this instance.**
+
+`CONNECT` is granted to `PUBLIC` by default on *every* database, and that
+includes the maintenance ones — so a role scoped to the ledger can still open a
+session on `postgres` or `template1` until you say otherwise:
+
+```sql
+REVOKE CONNECT ON DATABASE postgres FROM PUBLIC;
+REVOKE CONNECT ON DATABASE template1 FROM PUBLIC;
+```
+
+Then assert it, rather than assuming:
+
+```sql
+SELECT datname, has_database_privilege('chocofin', datname, 'CONNECT') AS can_connect
+FROM pg_database
+WHERE datallowconn
+ORDER BY datname;
+```
+
+`chocofin` must be the only row reading `t`. Any other application database
+sharing this instance has its own `PUBLIC` default and needs its own `REVOKE`;
+the query lists them all so you cannot miss one.
+
+Three things worth knowing about those revokes:
+
+- **Superusers are unaffected.** `sudo -u postgres psql` keeps working; the
+  revoke binds ordinary roles only.
+- **A database created later comes back with the `PUBLIC` default.** A new
+  database does not inherit `template1`'s ACL — its `datacl` starts null — so
+  the revoke does not propagate forward. That is why §9 tells you to re-apply
+  it after restoring into a freshly created database, and equally why
+  `restore-test.sh` is unaffected: its scratch database is created by, and
+  owned by, `chocofin_backup`.
+- **`pg_hba.conf` is the independent second layer.** Its database column names
+  `chocofin` and nothing else, so a login aimed at another database is refused
+  before authentication regardless of any grant. Once §4 is done you can prove
+  that from the bot LXC:
+
+  ```sh
+  psql "host=<DB_HOST> user=chocofin dbname=postgres sslmode=require" -c 'select 1'
+  ```
+
+  It must fail with `FATAL: no pg_hba.conf entry`. A password prompt instead
+  means a `pg_hba.conf` line is wider than §2 wrote it.
 
 ### The backup role
 
@@ -284,7 +387,7 @@ checks the mode at startup and refuses to run rather than let you debug that at
 
 ---
 
-## 5. Migrate
+## 5. Migrate and seed
 
 Alembic reads `DATABASE_URL` from the environment (`migrations/env.py`);
 `alembic.ini` deliberately has an empty `sqlalchemy.url`.
@@ -315,6 +418,81 @@ Note that `0002_case_insensitive_names` fails, by design, on a database that
 already contains case-duplicate account or category names. That is not a bug to
 work around: merging two accounts moves real money between them, and `entries`
 is append-only. Reconcile by hand with a void and a replacement, then re-run.
+
+### Seed the first household
+
+A migrated database is empty, and an empty database has no `members` row. The
+bot answers a Telegram user because a row there says so, and until `/link` lands
+there is no way to write that first row from inside the bot — so `/start` from
+your own account is refused until this runs.
+
+`<TELEGRAM_USER_ID>` is the numeric id, not the `@handle`. Any of the id-echo
+bots on Telegram will tell you yours; it is not a secret and it is not the
+token.
+
+```sh
+cd /opt/chocofin/app
+set -a; . /etc/chocofin/chocofin.env; set +a
+
+uv run python -m scripts.seed_household \
+    --household "Home" \
+    --telegram-user-id <TELEGRAM_USER_ID> \
+    --display-name "Alex" \
+    --account "Wallet:cash:opening=1500" \
+    --account "BPI:bank:opening=42350.75" \
+    --account "GCash:ewallet:opening=820.50" \
+    --account "Visa:credit_card:opening=-3000:limit=50000:billing=BPI"
+```
+
+It prints the database it is aimed at and asks you to type that database's name
+before it writes anything. `--yes` skips the question — never the echo — and is
+for scripts, not for saving four seconds here. `telegram_user_id` is globally
+UNIQUE: pointing this at the wrong database grants that Telegram account access
+to whatever ledger is there, and a later run cannot take it back.
+
+**`NAME:TYPE` then `key=value`.** Amounts are in **pesos**, converted to
+centavos once inside the script; never type centavos, and never a currency
+symbol.
+
+| Key | Applies to | If you leave it out |
+|---|---|---|
+| `opening=` | every account | the account starts at 0 |
+| `limit=` | credit cards only | **rejected** |
+| `billing=` | credit cards only | **rejected** |
+
+**Get `opening=` right the first time.** Every balance the app shows is
+`opening_balance_minor + SUM(legs)`. Seeding zero into an account that already
+holds money makes every balance and the net worth wrong from the first screen,
+and `entries` is append-only — the only later fix is an adjusting entry for
+money that never moved, sitting in the ledger permanently. Count the accounts
+now, on the day you deploy.
+
+**A card's opening balance is negative.** Liabilities are negative balances:
+`opening=-3000` is three thousand pesos owed. A card seeded positive adds its
+debt to net worth instead of subtracting it.
+
+**A card must name both `limit=` and `billing=`, or the run is refused.**
+Without a limit, available credit is `NULL` for the life of the card. Without a
+billing account, `settle_card` refuses to invent where the money came from and
+every `/pay` raises `CardHasNoBillingAccountError`. Half an account is worse
+than a clear error, because nothing afterwards tells you it is half.
+`billing=` may name an account created anywhere in the same command — order
+does not matter — or one already in the household, which is how you add a card
+months later.
+
+**Re-running is safe and is the normal way to add an account.** An existing
+household, member or account is left alone rather than duplicated, and an
+account that already exists keeps the opening balance, credit limit and billing
+account it has — the script reports the difference instead of writing over it:
+
+```
+account 'Visa' already exists
+'Visa' opening balance is -₱3,000.00, not -₱4,500.00 — left alone
+```
+
+That is not a failure; it is the script refusing to move balances behind your
+back. If the seeded value really is wrong, fix it deliberately — and read the
+paragraph above about what "fixing" an opening balance costs once entries exist.
 
 ---
 
@@ -361,6 +539,12 @@ listening socket here means something is very wrong.
 
 **4. The bot answers.** Send `/start` from an authorised Telegram account, then
 add a real expense and confirm it against the account balance.
+
+Check `/balances` *before* that first expense: every account must read exactly
+the `opening=` you gave it in §5, and the card must show available credit rather
+than nothing. Then the expense must move one balance by exactly its own amount.
+A balance that is wrong by a constant is a wrong `opening=`, and §5 explains why
+that is much cheaper to fix now than after a month of entries.
 
 **5. Authorisation rejects a stranger.** Message the bot from an account that is
 not a household member. It must refuse, and the refusal must come from the
